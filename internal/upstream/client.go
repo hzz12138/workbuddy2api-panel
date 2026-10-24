@@ -892,9 +892,31 @@ type CreditObserver func(uid string, credits int64)
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:    "https://copilot.tencent.com",
+		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		// ChatBaseCN 国内版 chat/模型目录上游 base。取 www.workbuddy.cn（官方主域），
+		// 不是 copilot.tencent.com（官方备用域）。
+		//
+		// 2026-10-25 对 WorkBuddy 5.8.3 分发包的只读逆向确认（main/dev-env-override.js）：
+		//
+		//	CN_SAAS_CORE_API_PRIMARY_ORIGIN   = 'https://www.workbuddy.cn'
+		//	CN_SAAS_CORE_API_ALTERNATE_ORIGIN = 'https://copilot.tencent.com'
+		//	CN_SAAS_CORE_API_BACKUP_ORIGIN    = 'https://wb.tencentbuddy.com'
+		//	CN_SAAS_CORE_API_TRUSTED_ORIGINS  = [PRIMARY, ALTERNATE, BACKUP]
+		//
+		// 且存在 resolveFailoverOriginReplay / resolveFailoverPair 的故障转移逻辑：
+		// ALTERNATE 只在 PRIMARY 不可用时才被使用。一个账号**长期 100% 走 ALTERNATE**
+		// 在官方视角里就是「这台机器的主域一直不通」——比用错一个 header 更硬的信号。
+		//
+		// 旧实现取 ALTERNATE 的理由是「copilot.tencent.com 对海外出口 TLS 握手直接复位」
+		// （见 cmd/server/config.go 的 cn.chat_base 注释）。该结论已过时：2026-10-25
+		// 从东京（腾讯云 AS132203）与首尔（AWS AS16509）两个海外出口实测，
+		// 三个域全部解析到同一 EdgeOne IP（43.159.104.94），/v3/config 均 200、
+		// /v2/chat/completions 均返回同一个 APISIX 401 页，TLS 握手 33-37ms，
+		// 无任何复位。故默认值切回主域。
+		//
+		// 若某部署确实只有 ALTERNATE 可达，配 cn.chat_base 覆盖即可（applyCNChatBase）。
+		ChatBaseCN:    "https://www.workbuddy.cn",
 		BillingBaseCN: "https://www.codebuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：

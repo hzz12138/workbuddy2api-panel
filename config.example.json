@@ -35,9 +35,9 @@
     "blackcat_enabled": true,
     "growth_enabled": true,
     "growth_concurrency": 1,
-    "jitter_minutes": 0,
-    "account_spread_minutes": 0,
-    "account_spread_min_gap_seconds": 0,
+    "jitter_minutes": 45,
+    "account_spread_minutes": 45,
+    "account_spread_min_gap_seconds": 5,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
     "include_disabled_in_tasks": false

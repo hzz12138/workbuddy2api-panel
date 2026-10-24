@@ -401,6 +401,21 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 时序抖动缺省开启（原为 0 = 精确整点）。
+	//
+	// 为什么改默认值：0 意味着所有账号在同一秒触发同一动作——这是最好认的时间
+	// 形状。一个部署里 N 个号整点同秒签到/上报，上游不需要任何内容指纹，只看
+	// 时间戳分布就能把它们聚成一批。
+	//
+	// 取值 45 分钟：小于最小的触发间隔（checkin/travel 两档 12h、activity 24h），
+	// 不会把相邻两档的窗口叠在一起；大于单次任务的实际执行时长（秒级），保证
+	// 摊开后不会互相阻塞。min_gap 5s 让同批两个号的偏移撞车时被推开，避免退化成
+	// 「两个号同秒」。
+	//
+	// 显式配 0 仍是合法值（精确整点），只是不再是默认。
+	c.Schedule.JitterMinutes = 45
+	c.Schedule.AccountSpreadMinutes = 45
+	c.Schedule.AccountSpreadMinGapSeconds = 5
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0

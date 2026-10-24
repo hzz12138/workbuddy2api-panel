@@ -15,6 +15,12 @@ import (
 const mpReportPath = "/v2/report"
 
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
+//
+// machineId 曾是硬编码 UUID 0655736a-607f-4d9d-b430-58176ee9a090——所有部署、
+// 所有账号上报同一个设备号，是**最硬的跨部署聚类键**（一次 GROUP BY 就能圈出
+// 全簇）。改为按 uid 稳定派生的 UUID v4 形态：同 uid 恒同值、异 uid 互异、
+// 跨重启稳定，且与 desktop.go 的 machineId 同为 UUID 形态（官方 machineId 来自
+// 注册表 MachineGuid，本来就是 UUID，见 devicefp.go 文件头）。
 func mpEventBase(a *auth.Auth) map[string]any {
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
@@ -28,7 +34,7 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"os":           "windows",
 		"osVersion":    "11",
 		"arch":         "x64",
-		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
+		"machineId":    stableDeviceUUID(a.UID, "mp-machine"),
 		"timezone":     "Asia/Shanghai",
 		"userId":       a.UID,
 		"userNickname": a.Nickname,

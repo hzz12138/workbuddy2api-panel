@@ -95,8 +95,15 @@ func (c *Client) desktopHost(a *auth.Auth) string {
 	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
 }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
-// 幂等：同一账号每次生成相同值，模拟固定设备。
+// deriveID 由 uid 稳定派生一个 36 位**裸 hex** 标识（无横线），幂等。
+//
+// 使用边界（2026-10-25 分发包逆向确认，见 devicefp.go 文件头）：
+//   - **qimei36 专用**：腾讯设备号本来就是 36 位小写十六进制，形态正确。
+//   - **不可用于 machineId / sessionId**：官方那两处是 UUID
+//     （sidecar-manager 的 machineIdSync 读注册表 MachineGuid，正则
+//     /\w{8}-\w{4}-\w{4}-\w{4}-\w{12}/；sessionId 来自 randomUUID()）。
+//     裸 hex 与 UUID 是两种可区分的形态，同一账号两套形态本身即可判别。
+//     那两处改用 stableDeviceUUID（见 devicefp.go）。
 func deriveID(a *auth.Auth, salt string) string {
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
@@ -107,9 +114,15 @@ type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 // 版本三元组按 realm 取（见 desktopTriple）；qimei36 仅国内版有（见下）。
+//
+// 设备四元组（osVersion / cpuModel / cpuCores / memorySize）从 devicefp.go 的
+// 真实机型池按 uid 取样，而不是钉死一台机器：官方是运行时读本机
+// （node_os.cpus()[0].model 等），全簇同一块 CPU 在官方分布里概率为零。
+// 同 uid 恒得同一台机器，跨重启稳定。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
 	ver, commit, release := desktopTriple(a)
+	dev := pickDevice(a.UID)
 	fp := map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
@@ -122,18 +135,22 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   ver,
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
-		"extName":      "workbuddy-desktop",
-		"extVersion":   ver,
-		"os":           "win32",
-		"arch":         "x64",
+		// machineId / sessionId 用 UUID v4 形态（官方读注册表 MachineGuid /
+		// randomUUID()，两者都是带横线的 UUID）；qimei36 仍用 36 裸 hex。
+		// 详见 devicefp.go 文件头与 deriveID 的使用边界注释。
+		"machineId":  stableDeviceUUID(a.UID, "machine"),
+		"sessionId":  stableDeviceUUID(a.UID, "session"),
+		"extName":    "workbuddy-desktop",
+		"extVersion": ver,
+		"os":         "win32",
+		"arch":       "x64",
 		// osVersion / cpuModel / cpuCores / memorySize 是真机上报名（5.8.4 实测）：
-		// 这些字段上游侧用于设备侧写，缺 cpuModel 是最明显的「非桌面端」特征。
-		"osVersion":  "10.0.28000",
-		"cpuModel":   "11th Gen Intel(R) Core(TM) i5-11320H @ 3.20GHz",
-		"cpuCores":   8,
-		"memorySize": 16,
+		// 这些字段上游侧用于设备侧写，缺 cpuModel 是最明显的「非桌面端」特征；
+		// 反过来，全部部署都是同一块 CPU 同样是特征。故按 uid 从真实机型池取样。
+		"osVersion":  dev.OSVersion,
+		"cpuModel":   dev.CPUModel,
+		"cpuCores":   dev.CPUCores,
+		"memorySize": dev.MemorySize,
 		"timestamp":  now,
 		"presentAt":  now,
 	}
@@ -329,13 +346,17 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // ReportWebEvent 以 Web 端指纹向 www.workbuddy.cn/v2/report 上报单事件。
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
+//
+// machineId 用 UUID v4 形态（浏览器的 crypto.randomUUID() 产物就是带横线 UUID），
+// 与桌面链路同族但派生 purpose 不同——web 与 desktop 是两个不同的浏览器/客户端
+// 存储槽，官方不会共用同一个值。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
-		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
+		"machineId": stableDeviceUUID(a.UID, "web-machine"), "userId": a.UID,
 		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
