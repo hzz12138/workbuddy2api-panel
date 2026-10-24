@@ -42,6 +42,41 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 	return c.doJSON(req)
 }
 
+// reportJSON 发 /v2/report 请求。与 billingJSON 的唯一差别：**不发 X-CodeBuddy-Request**。
+//
+// 2026-10-25 mitmproxy 抓 WorkBuddy 5.8.3 真机实测，/v2/report 的完整头只有 10-12 个：
+//
+//	accept: application/json, text/plain, */*
+//	authorization / connection / content-length
+//	content-type: application/json;charset=UTF-8
+//	host / user-agent / x-domain / x-product / x-request-id / x-user-id
+//
+// **没有 x-codebuddy-request**。而 billingJSON 经 BillingHeaders 会注入它
+// （injectCodeBuddyRequest），对 report 来说是多余的头。
+//
+// 为什么不直接改 BillingHeaders：checkin / balance / travel / tasks 同走那一条路径，
+// 但那几个端点没有真机对照证据，贸然去掉风险未知。只给已实证的 report 单开一条。
+func (c *Client) reportJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, c.billingBase(a)+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	c.BillingHeaders(req, a)
+	// 真机 report 不带这个风控闸门头（见函数注释的实测头集合）。
+	req.Header.Del("X-CodeBuddy-Request")
+	// 真机 report 的 Accept 是宽松形式（text/plain + */*），不是 billing 的纯 json。
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	return c.doJSON(req)
+}
+
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
@@ -239,6 +274,6 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	if err != nil {
 		return err
 	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	_, err = c.reportJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
 	return err
 }

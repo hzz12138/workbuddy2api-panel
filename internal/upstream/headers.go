@@ -3,9 +3,7 @@
 package upstream
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -192,33 +190,21 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
-// deriveAccountStableID 按 uid + 用途盐稳定派生 36 hex 设备/会话标识。
-// 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包派生盐的本质差异：
-// 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
-// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。用 sha256 与项目
-// 既有派生（session/ids.go、cache_key.go）保持一致；截 36 hex 提供更长熵。
+// 已删除 deriveAccountStableID / injectAccountStableHeaders（2026-10-25）。
 //
-// 两个用途：
-//   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
-//   - purpose="session" → X-Session-ID（账号固定会话，跨重启稳定）
+// 旧实现按 uid 派生 36 hex 并注入 X-Machine-ID / X-Session-ID，理由是「每账号一台
+// 固定虚拟设备，防多号被按设备指纹缺失关联」。该理由不成立，原因有二：
 //
-// 与 injectDeviceToken 的 X-Device-Token 并存不冲突：那是登录时上游签发的
-// 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
-// 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
-func deriveAccountStableID(uid, purpose string) string {
-	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
-}
-
-// injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
-// 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
-func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
-	if a == nil || a.UID == "" {
-		return
-	}
-	req.Header.Set("X-Machine-ID", deriveAccountStableID(a.UID, "machine"))
-	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
-}
+//  1. **官方客户端根本不发这两个头**。2026-10-25 用 mitmproxy 抓 WorkBuddy 5.8.3
+//     真机（Windows 桌面版）两轮共 150 条请求，chat/completions 的完整头集合里
+//     没有 X-Machine-ID，也没有 X-Session-ID。官方会话标识是
+//     X-Conversation-ID / X-Session-Id（后者只在 auth/state 链路出现）。
+//  2. **多一个客户端从不发的头，比缺一个头更显眼**。逐头比对时，「官方 42 个头
+//     你多出 2 个」和「你缺 2 个」是同一级别的异常，而前者还会暴露派生规律
+//     （36 hex、按 uid 恒定、跨重启不变）。
+//
+// 设备侧写的正确载体是 /v2/report 的 machineId / sessionId（真机确有，且是 UUID），
+// 见 devicefp.go。头层的设备语义由 X-Device-Token 承担（真机必带，来自图灵盾 SDK）。
 
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
@@ -236,10 +222,6 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
-	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
-	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
-	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
-	c.injectAccountStableHeaders(req, a)
 }
 
 // acceptLanguageFor 返回 Accept-Language。
@@ -334,17 +316,16 @@ type ChatMeta struct {
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
-	// chat 出站头剥离：CommonHeaders 是 REST 层通用形态，桌面端 chat 并不发这几个
-	// （两版客户端真机实测，见 capture/raw3 + capture/raw8 的逐头对照）：
-	//   Origin / Referer     ← CLI 客户端没有浏览器语义，chat 路径从不发
-	//   Accept-Language      ← 桌面端 chat 不发（billing 层才偶发 zh）
-	//   X-Machine-ID / X-Session-ID ← 这两个是网关自造的 36 hex 派生值，客户端没有
-	// 保留在 CommonHeaders 里是为了不动 billing/checkin 等域（那层没有真机对照证据）。
+	// chat 出站头剥离：CommonHeaders 是 REST 层通用形态，桌面端 chat 并不发这几个。
+	// 2026-10-25 mitmproxy 抓 WorkBuddy 5.8.3 真机两轮 150 条请求确认：
+	//   Origin / Referer      ← 真机 chat 请求里都不存在
+	//   Accept-Language       ← 真机 chat 请求里不存在（billing 层才偶发 zh）
+	// 两个 Del 均与实测一致，保留。
+	// （X-Machine-ID / X-Session-ID 的 Del 已随之删除：那两个头在 CommonHeaders 里
+	//   也不再注入——真机根本没这两个头，见该函数上方的注释。）
 	req.Header.Del("Origin")
 	req.Header.Del("Referer")
 	req.Header.Del("Accept-Language")
-	req.Header.Del("X-Machine-ID")
-	req.Header.Del("X-Session-ID")
 	// Accept 与官方 chat 完全一致：客户端只发 application/json，照样收 SSE 流
 	// （两版实测；旧值多带 ", text/event-stream" 属自造）。
 	// Accept-Encoding 刻意不设：官方发 br/gzip 全集，但显式设置会关闭 net/http 的
