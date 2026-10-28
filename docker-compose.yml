@@ -1,6 +1,14 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      # 版本号与更新源仓库由构建参数注入（Dockerfile 的 ARG + -X main.appVersion
+      # / main.appRepository）。不传则 appVersion=dev、appRepository=源码常量：
+      # 面板显示 dev、updater 也不会误把上游构建当成「新版本」。
+      # 从 .env 读（compose 自动加载同目录 .env），没配就走默认。
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        APP_REPOSITORY: ${APP_REPOSITORY:-hzz12138/workbuddy2api-panel}
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
