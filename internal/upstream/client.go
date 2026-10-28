@@ -45,7 +45,7 @@ const (
 	ErrImageInvalid                     // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrModelParamInvalid                // 11133「参数被模型供应商拒绝」（缺/空 messages、模型不支持图片等）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrClient                           // 其他 4xx / 业务错误
-	ErrUpstreamBusy                     // 6021「queue.full.title」渠道级准入队列满 → 上游容量信号：不罚号、不轮转，末端 503 透传原文
+	ErrUpstreamBusy                     // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满 → 上游容量信号：不罚号、不轮转，末端 503 透传原文
 	ErrToolMismatch                     // 11148「tool calls and tool results do not match」 → 请求内容级配对断裂：不罚号、不轮转，末端 400 透传原文
 )
 
@@ -640,13 +640,14 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
 	}
-	// 6021「queue.full.title」渠道级准入队列满：上游容量信号，不是账号限流。判在
-	// 429 兜底之前——按 ErrSoftRate 罚号会与全冷却兜底互相喂（兜底把冷却号再送
-	// 上游，再撞 6021 又续订 600s），把几秒的排队放大成整段时间全量 429
-	//（2026-10-15 实案：18 次全落 soft_rate，上游 PR #180/#185）。任意状态码都认
-	//（防上游换状态码）；结构化 code 主判，requestId 等字段恰好含 "6021" 不误伤
-	//（hasBusinessCode 只认 "code": 键）。
-	if hasBusinessCode(body, "6021") {
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：上游
+	// 容量信号，不是账号限流。判在 429 兜底之前——按 ErrSoftRate 罚号会与全冷却兜底
+	// 互相喂（兜底把冷却号再送上游，再撞又续订 600s），把几秒的排队放大成整段时间
+	// 全量 429（6021：2026-10-15 实案 18 次全落 soft_rate，PR #180/#185；6020：
+	// 2026-10-24 实案同样落 soft_rate 账号级冻结 600s）。两个 code 同族同判。
+	// 任意状态码都认（防上游换状态码）；结构化 code 主判，requestId 等字段恰好
+	// 含 "6020"/"6021" 不误伤（hasBusinessCode 只认 "code": 键）。
+	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -831,6 +832,11 @@ type Client struct {
 	// 与上游既有行为一致）或 "identity"（仅 system/developer；features.sanitize_brand_scope）。
 	SanitizeBrandScope atomic.Value // string
 
+	// effortPolicy 网关思考档位策略（config thinking 节，见 effort_policy.go）：
+	// 面板保存配置热更新，chat 热路径用 atomic.Pointer 读取——存入的是规范化后的
+	// 不可变副本，读侧永不加锁，也无数据竞争。
+	effortPolicy atomic.Pointer[EffortPolicy]
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -895,18 +901,17 @@ func New() *Client {
 		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		// ChatBaseCN 国内版 chat/模型目录上游 base。取 www.workbuddy.cn（官方主域），
-		// 不是 copilot.tencent.com（官方备用域）。
+		// 不是 copilot.tencent.com（官方备用域）。两条独立证据：
 		//
-		// 2026-10-25 对 WorkBuddy 5.8.3 分发包的只读逆向确认（main/dev-env-override.js）：
+		//  1. 官方桌面端 product.json 的 endpoint 是 www.workbuddy.cn，copilot 是
+		//     NetworkFailover 里的备选；一个账号长期 100% 走 ALTERNATE 在官方视角里
+		//     就是「这台机器的主域一直不通」，比用错一个 header 更硬的信号。
+		//  2. 2026-10-25 对 WorkBuddy 5.8.3 分发包的只读逆向确认（main/dev-env-override.js）：
 		//
 		//	CN_SAAS_CORE_API_PRIMARY_ORIGIN   = 'https://www.workbuddy.cn'
 		//	CN_SAAS_CORE_API_ALTERNATE_ORIGIN = 'https://copilot.tencent.com'
 		//	CN_SAAS_CORE_API_BACKUP_ORIGIN    = 'https://wb.tencentbuddy.com'
 		//	CN_SAAS_CORE_API_TRUSTED_ORIGINS  = [PRIMARY, ALTERNATE, BACKUP]
-		//
-		// 且存在 resolveFailoverOriginReplay / resolveFailoverPair 的故障转移逻辑：
-		// ALTERNATE 只在 PRIMARY 不可用时才被使用。一个账号**长期 100% 走 ALTERNATE**
-		// 在官方视角里就是「这台机器的主域一直不通」——比用错一个 header 更硬的信号。
 		//
 		// 旧实现取 ALTERNATE 的理由是「copilot.tencent.com 对海外出口 TLS 握手直接复位」
 		// （见 cmd/server/config.go 的 cn.chat_base 注释）。该结论已过时：2026-10-25
@@ -916,7 +921,10 @@ func New() *Client {
 		// 无任何复位。故默认值切回主域。
 		//
 		// 若某部署确实只有 ALTERNATE 可达，配 cn.chat_base 覆盖即可（applyCNChatBase）。
-		ChatBaseCN:    "https://www.workbuddy.cn",
+		ChatBaseCN: "https://www.workbuddy.cn",
+		// BillingBaseCN 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
+		// 桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三类区分（README「任务计分」），
+		// 改这里会连带改掉 CLI 类任务的指纹来源。
 		BillingBaseCN: "https://www.codebuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
@@ -1040,11 +1048,15 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
+	} else {
+		// CN 域同口径：与 /v1/models 的 EffortListing 声明同源，保证「声明什么档位
+		// 就按什么档位降级/补档」（此前 CN 只有远端桶，静态表只在列表侧生效）。
+		efforts, defs = cnEffortMap(efforts, defs)
 	}
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。与 body 归一化共用
 	// prepareBodyOpt 的同一次 map 解析，不再二次 Unmarshal/Marshal。
-	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, uid, conversationID, true)
+	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1084,6 +1096,29 @@ func realmKey(realm string) string {
 		return "cn"
 	}
 	return realm
+}
+
+// SetEffortPolicy 热更新网关思考档位策略；nil = 关闭策略（行为退回旧管线）。
+// 存入规范化副本：chat 热路径只读不加工，避免每请求重复字符串归一。
+func (c *Client) SetEffortPolicy(p *EffortPolicy) {
+	if c == nil {
+		return
+	}
+	if p == nil {
+		c.effortPolicy.Store(nil)
+		return
+	}
+	out := p.Normalized()
+	c.effortPolicy.Store(&out)
+}
+
+// EffortPolicy 返回当前策略快照（可能为 nil）；返回指针指向不可变副本，调用方
+// 不得修改。chat 热路径每请求读一次。
+func (c *Client) EffortPolicy() *EffortPolicy {
+	if c == nil {
+		return nil
+	}
+	return c.effortPolicy.Load()
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
@@ -1439,7 +1474,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// （官方桌面端头与体都带 conversationRequestId）。见 conv_fields.go。
 	prepared = injectConversationFields(prepared, meta.ConversationRequestID)
 	if timing != nil {
-		timing.Prep += time.Since(prepStart)
+		// Zero means unmeasured; coarse clocks can report zero for completed work.
+		timing.Prep += max(time.Since(prepStart), time.Nanosecond)
 		timing.RequestedEffort = requested // 客户端原始档位（未携带 → 空）
 		timing.Effort = effort             // 生效档位（可能被降级；空 = 未参与降级）
 	}
@@ -1463,7 +1499,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		doStart := time.Now()
 		resp, err := c.chatHTTP().Do(req)
 		if timing != nil {
-			timing.Do += time.Since(doStart)
+			timing.Do += max(time.Since(doStart), time.Nanosecond)
 		}
 		if err != nil {
 			cancel()

@@ -6,8 +6,8 @@ const LS_REMARKS = 'wb2api.remarks.v1';
 let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
-let overviewData = null, cfgLoaded = null;
-let logPin = true, loginState = null, loginTimer = null;
+let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
+let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -92,6 +92,28 @@ function esc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/* setHTML：内容与上次相同时不碰 DOM（perf）。
+ *
+ * 面板每 5 秒重建一次整张表（innerHTML = ...）。即使内容没变，也会：
+ *  - 重新解析整段 HTML（构造大量临时节点），
+ *  - 丢弃旧子树（整批 GC 压力），
+ *  - 触发一次全表重排（LayoutCount / RecalcStyleCount 随之上涨）。
+ *
+ * 实测（账号池视图，10 个账号）：每 5 秒 DOM 节点数在 3278↔7088 之间震荡——
+ * 一次轮询就把整表换掉。数据没变时这纯属白烧 CPU 与内存。
+ *
+ * 做法：记住上次写入的 HTML 字符串，相同则跳过赋值（DOM 原样保留，滚动位置、
+ * 选中态、事件绑定的 DOM 节点都不会丢）。注意：不能改成 diff/patch——那会引入
+ * 「局部更新丢状态」的复杂度，而这里只要「完全相同就不动」即可覆盖绝大部分轮次。
+ */
+let lastHTML = new WeakMap();
+function setHTML(el, html) {
+  if (!el) return;
+  if (lastHTML.get(el) === html) return;
+  lastHTML.set(el, html);
+  el.innerHTML = html;
 }
 function ago(iso) {
   if (!iso || iso.startsWith('0001-')) return '—';
@@ -427,7 +449,7 @@ $('btnLogout').onclick = () => {
 };
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -436,12 +458,15 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
-  if (v === 'logs') loadLogs();
+  // 切到日志视图：本地窗口为空（首次）时全量拉一次；已有窗口则继续增量。
+  // 注意**不要**在每次切视图时 resetLogWindow()——那会把增量游标清掉，下一轮
+  // 又变成全量拉，白白丢掉增量带来的收益。
+  if (v === 'events') loadEvents();
+  if (v === 'logs') { if (!logRows.length) resetLogWindow(); loadLogs(); }
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'balhist') loadBalance();
-  // 补偿状态按需拉取：compData 为空才打上游（失败留空 → 下次进入重试）。
-  if (v === 'taskscenter') { reattachQueueView(); if (!compData) loadCompensation(); }
+  if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -459,12 +484,12 @@ setTimeout(() => {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  tb.innerHTML = list.map(s => {
+  setHTML(tb, list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -563,7 +588,7 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
       ].map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
       '</div></td></tr>';
-  }).join('');
+  }).join(''));
 }
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。后端已按
@@ -574,16 +599,16 @@ function renderModelLocks(rows) {
   const list = Array.isArray(rows) ? rows : [];
   $('mlNote').textContent = list.length ? list.length + ' 个模型受限' : '';
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    setHTML(tb, '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>');
     return;
   }
-  tb.innerHTML = list.map(r => {
+  setHTML(tb, list.map(r => {
     const [cls, label] = ML_STATE[r.state] || ['', r.state || '—'];
     const unlock = r.unlock_at && !/^0001-/.test(r.unlock_at) ? fmtLocalDateTime(r.unlock_at) : '—';
     const fully = r.fully_unlock_at && !/^0001-/.test(r.fully_unlock_at) ? fmtLocalDateTime(r.fully_unlock_at) : '—';
     return '<tr>' +
       '<td><b>' + esc(r.model) + '</b></td>' +
-      '<td>' + (r.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '国内版') + '</td>' +
+      '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
       '<td class="num">' + (r.locked || 0) + '</td>' +
@@ -591,13 +616,111 @@ function renderModelLocks(rows) {
       '<td class="num">' + esc(fully) + '</td>' +
       '<td title="' + esc(r.reason || '') + '">' + esc(r.reason || '—') + '</td>' +
       '</tr>';
-  }).join('');
+  }).join(''));
 }
+
+function displayVersion(version) {
+  const value = String(version || 'dev').replace(/^v/, '');
+  return value === 'dev' ? 'dev' : 'v' + value;
+}
+
+function renderUpdateStatus(update) {
+  if (!update) return;
+  updateData = update;
+  const local = displayVersion(update.current_version);
+  $('navSub').textContent = local;
+  $('navVer').textContent = local;
+  $('navUpdate').hidden = !update.update_available;
+  $('navUpdate').textContent = '有更新';
+  $('navUpdate').title = update.update_available ? '发现 v' + update.latest_version + '，点击查看更新操作' : '';
+  const note = $('updateNote');
+  if (update.installing) {
+    note.textContent = '正在准备更新…';
+  } else if (update.last_error) {
+    note.textContent = '更新失败：' + update.last_error;
+  } else if (update.update_available) {
+    note.textContent = '发现新版本 v' + update.latest_version + (update.can_install ? '' : ' · 请手动更新');
+  } else if (update.latest_version) {
+    note.textContent = '已是最新版本 · v' + update.latest_version;
+  } else {
+    note.textContent = '尚未检查';
+  }
+  $('btnUpdateInstall').hidden = !update.update_available || !update.can_install;
+  $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
+  $('btnUpdateRelease').hidden = !update.update_available || !!update.can_install || !update.release_url;
+  $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+}
+
+async function checkForUpdates() {
+  if (updateBusy || updateData?.installing) return;
+  updateBusy = true;
+  const button = $('btnUpdateCheck');
+  button.disabled = true;
+  button.textContent = '检查中…';
+  try {
+    const update = await api('update/check', { method: 'POST' });
+    renderUpdateStatus(update);
+    toast(update.update_available ? '发现新版本 v' + update.latest_version : '当前已是最新版本', update.update_available ? 'ok' : '');
+  } catch (e) {
+    try { renderUpdateStatus(await api('update')); } catch (_) {}
+    toast('检查更新失败：' + e.message, 'err');
+  } finally {
+    updateBusy = false;
+    if (updateData) renderUpdateStatus(updateData);
+    button.textContent = '检查更新';
+  }
+}
+
+async function installUpdate() {
+  if (updateBusy || !updateData || updateData.installing || !updateData.can_install || !updateData.update_available) return;
+  if (!confirm('将安装 v' + updateData.latest_version + ' 并重启服务，期间服务会短暂中断。请避开正在处理的请求，确认继续？')) return;
+  const button = $('btnUpdateInstall');
+  updateBusy = true;
+  button.disabled = true;
+  button.textContent = '准备更新…';
+  try {
+    const result = await api('update/install', { method: 'POST' });
+    renderUpdateStatus(result.status);
+    toast('更新已准备，服务即将重启', 'ok');
+  } catch (e) {
+    toast('更新失败：' + e.message, 'err');
+  } finally {
+    updateBusy = false;
+    if (updateData) renderUpdateStatus(updateData);
+    button.textContent = '立即更新';
+  }
+}
+
+function openLatestRelease() {
+  if (updateData && updateData.release_url) open(updateData.release_url, '_blank', 'noopener');
+}
+
+if ($('btnUpdateCheck')) $('btnUpdateCheck').onclick = checkForUpdates;
+if ($('btnUpdateInstall')) $('btnUpdateInstall').onclick = installUpdate;
+if ($('btnUpdateRelease')) $('btnUpdateRelease').onclick = openLatestRelease;
+if ($('navUpdate')) $('navUpdate').onclick = () => {
+  go('config');
+  $('updateNote').scrollIntoView({ block: 'center', behavior: 'smooth' });
+};
 
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    // 应用服务端透出的自动刷新间隔（首轮 overview 之后即生效；后续不变则不重建表）。
+    if (d.poll_interval_sec !== undefined && d.poll_interval_sec !== null) {
+      const sec = Number(d.poll_interval_sec);
+      if (Number.isFinite(sec)) {
+        const wantAuto = sec >= 0;
+        const wantMs = wantAuto ? (sec > 0 ? sec * 1000 : 5000) : pollIntervalMs;
+        if (wantAuto !== pollAutoRefresh || wantMs !== pollIntervalMs) {
+          pollAutoRefresh = wantAuto;
+          pollIntervalMs = wantMs;
+          startPolling();
+        }
+      }
+    }
+    const previousUpdate = typeof updateData !== 'undefined' ? updateData : null;
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -608,8 +731,11 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
+    if (typeof renderUpdateStatus === 'function') renderUpdateStatus(d.update || { current_version: d.version });
+    if (d.update && d.update.update_available &&
+      (!previousUpdate || !previousUpdate.update_available || previousUpdate.latest_version !== d.update.latest_version)) {
+      toast('发现新版本 v' + d.update.latest_version, 'ok');
+    }
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
@@ -621,7 +747,11 @@ async function loadOverview(quiet) {
     renderModelLocks(d.model_locks);
     // 到期提醒随首页统计一起刷新：只用响应里已有的最早到期快照，零上游请求。
     renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+  } catch (e) {
+    // 轮询（quiet）时也留痕：渲染异常被静默吞掉的表现就是「统计正常、表格空白」
+    console.error('[panel] 首页刷新失败', e);
+    if (!quiet) toast(e.message, 'err');
+  }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -800,7 +930,7 @@ function imageRateCell(m) {
 
 async function loadModels(force) {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="9"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
@@ -817,7 +947,7 @@ async function loadModels(force) {
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="9"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
       $('mdNote').textContent = '上游未返回模型';
       return;
@@ -833,7 +963,7 @@ async function loadModels(force) {
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">' + esc(e.message) + '</div></td></tr>';
     $('mdCount').textContent = '';
   }
 }
@@ -966,7 +1096,7 @@ function mdRowHtml(m, pr) {
   // 出图模型没有思考档位（上游目录里它本就不带 reasoning 字段）：显示 —，不写"不支持思考"。
   const effs = m.image_generation ? '<span style="color:var(--ink-3)">—</span>'
     : eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? (m.default_effort ? '固定档 · 默认 ' + esc(m.default_effort) : '固定档 · 默认档上游未报') : '不支持思考') + '</span>';
   // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
   if (m.tier) caps.push('<span class="tag warn" title="上游付费层级（' + esc(m.tier) + '）：切换模型前留意，免费账号可能调不通或排队靠后">' + esc(m.tier) + '</span>');
@@ -981,19 +1111,59 @@ function mdRowHtml(m, pr) {
   }
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-    '<td class="num">' + rateCell(m) + '</td>' +
+  // 网关档位：选项原样取该模型「支持的思考档位」（可关思考的模型再补 off），
+  // 不合成"最高档（x）"之类的文案；默认选中支持的最高档（缺省 default_effort=max
+  // 的语义）。上游固定档的模型（没有 supported_efforts）也给一个单选项，表示网关
+  // 只会跟随该档；出图模型与完全没有档位声明的模型仍渲染 —。
+  const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+  const gwOpts = [];
+  for (const e of (m.supported_efforts || [])) {
+    const v = String(e).trim().toLowerCase();
+    if (v && !gwOpts.includes(v)) gwOpts.push(v);
+  }
+  const fixedTier = !gwOpts.length && m.supports_reasoning && m.default_effort
+    ? String(m.default_effort).trim().toLowerCase() : '';
+  if (fixedTier) gwOpts.push(fixedTier);
+  if (m.can_disable_thinking && gwOpts.length && !gwOpts.includes('off')) gwOpts.push('off');
+  const gwTop = gwOpts.filter(t => t !== 'off')
+    .sort((a, b) => (EFFORT_RANK[b] || 0) - (EFFORT_RANK[a] || 0))[0] || '';
+  const gwPicked = gwOpts.includes(m.gateway_effort) ? m.gateway_effort : gwTop;
+  let gw;
+  if (m.image_generation || !gwOpts.length) {
+    gw = '<td class="gw"><span style="color:var(--ink-3)">—</span></td>';
+  } else {
+    const gwFixed = !!fixedTier && !m.can_disable_thinking;
+    const gwDisabled = m.gateway_policy_enabled === false || gwFixed;
+    const gwTitle = m.gateway_policy_enabled === false
+      ? ' title="思考档位策略已关闭，网关不会注入档位；到「配置 → 思考档位」打开"'
+      : (gwFixed ? ' title="上游固定档，网关只需跟随，不可调"' : '');
+    gw = '<td class="gw"><select data-effort-id="' + esc(m.id) + '"' +
+      (gwDisabled ? ' disabled' : '') + gwTitle + '>' +
+      gwOpts.map(t => '<option value="' + esc(t) + '"' + (t === gwPicked ? ' selected' : '') + '>' + esc(t) + '</option>').join('') +
+      '</select></td>';
+  }
+  // 下游可见：关掉 = 进 models.hidden（/v1/models 不列、点名调用直接拒绝），
+  // 保存即热生效；行整体降透明并把开关留在原列，方便再打开。
+  const vis = '<td class="vis"><label title="' + (m.hidden
+      ? '当前不对下游暴露：客户端列表里看不到且点名调用会被拒绝；打开即恢复'
+      : '当前对下游暴露：关闭后 /v1/models 不再列出该模型，点名调用直接拒绝') + '">' +
+    '<input type="checkbox" data-model-id="' + esc(m.id) + '"' + (m.hidden ? '' : ' checked') + '>可见</label></td>';
+  return '<tr' + (m.hidden ? ' class="md-off"' : '') + '><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+    '<td class="num">' + rateCell(m) + '</td>' + gw +
     '<td>' + (m.default_effort && !m.image_generation ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
     '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-    outCell(m, pr) + '</tr>';
+    outCell(m, pr) + vis + '</tr>';
 }
 
 function renderModels() {
   const tb = $('mdBody');
-  const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  const sorted = mdSortList(mdAll.filter(m => mdMatch(m)));
+  // 下游已隐藏的模型统一排到末尾（各自保持当前排序规则内的相对顺序）；重新打开
+  // 即回到排序规则给出的原位置——不额外记忆旧下标，避免两套顺序互相漂移。
+  const list = sorted.filter(m => !m.hidden).concat(sorted.filter(m => m.hidden));
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
@@ -1002,6 +1172,45 @@ function renderModels() {
     : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
     : mdAll.length + ' 个模型';
   $('mdCount').className = filtered ? 'note src-off' : 'note';
+}
+
+// 行内「下游可见」开关：POST 写 models.hidden（保存即热生效），成功后本地更新
+// 并重排——隐藏行落到末尾，重新打开回到排序规则给出的原位置。失败回滚勾选态。
+// 行内「网关档位」下拉同表：POST 写 thinking.model_defaults 的精确键。
+$('mdBody').addEventListener('change', async ev => {
+  const sel = ev.target.closest('select[data-effort-id]');
+  if (sel) return saveGatewayEffort(sel);
+  const cb = ev.target.closest('input[data-model-id]');
+  if (!cb) return;
+  const id = cb.dataset.modelId, hidden = !cb.checked;
+  cb.disabled = true;
+  try {
+    await api('model_hidden', { method: 'POST', body: JSON.stringify({ id, hidden }) });
+    const m = mdAll.find(x => x.id === id);
+    if (m) m.hidden = hidden;
+    renderModels();
+    toast((hidden ? '已隐藏 ' : '已恢复 ') + id + (hidden ? '（下游不可见）' : '（下游可见）'), 'ok');
+  } catch (e) {
+    cb.checked = !cb.checked;
+    toast('切换失败：' + e.message, 'err');
+  } finally { cb.disabled = false; }
+});
+
+// saveGatewayEffort 行内「网关档位」：选项即模型支持的档位（含 off），选中即写
+// thinking.model_defaults 的「域:模型」精确键并热生效；失败直接重渲染回滚到
+// 服务端实际值（比手工还原选中的 option 可靠）。
+async function saveGatewayEffort(sel) {
+  const id = sel.dataset.effortId, effort = sel.value;
+  sel.disabled = true;
+  try {
+    await api('model_effort', { method: 'POST', body: JSON.stringify({ id, effort }) });
+    const m = mdAll.find(x => x.id === id);
+    if (m) m.gateway_effort = effort;
+    toast('已设置 ' + id + ' 的网关档位 = ' + effort, 'ok');
+  } catch (e) {
+    toast('设置失败：' + e.message, 'err');
+    renderModels();
+  } finally { sel.disabled = false; }
 }
 
 function resetModelFilter() {
@@ -1027,6 +1236,18 @@ $('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
+// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSinceTs 是下次增量的起点。
+// 常态每 5 秒只传新增行，不再每轮重拉 500 行（~90KB）并重建整块 DOM。
+// LOG_ROWS_MAX 与服务端环形缓冲同量级（500）——本地窗口不必更大。
+let logRows = [];
+let logSinceTs = null;
+let logSince = '';
+const LOG_ROWS_MAX = 500;
+// 增量游标最长有效期：超过则改全量拉（服务端环形缓冲只有 500 行，久了会淘汰
+// 中间旧行，增量就拿不到「完整的一段」）。
+const LOG_CURSOR_MAX_AGE_MS = 5 * 60 * 1000;
+// resetLogWindow 丢弃本地窗口，下次改为全量拉（切视图/手动重载时用）。
+function resetLogWindow() { logRows = []; logSinceTs = null; logSince = ''; }
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1053,31 +1274,64 @@ async function loadLogs() {
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
   try {
-    const [d, metrics, requestRows, credit, errSum] = await Promise.all([
-      api('logs'),
-      api('request_metrics').catch(() => ({})),
+    // 归档是否开启要先知道，否则无法决定 request_metrics 要不要带 recent。
+    // 先拉指标（recent=0，不带那 100 条事件），再用它决定请求记录表的数据源。
+    const metrics = await api('request_metrics?recent=0').catch(() => ({}));
+    const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
+    // 运行日志：常态只传**新增行**（?since=），不再每 5 秒重拉 500 行。
+    // logRows 是本地累积的窗口（上限 LOG_ROWS_MAX）；首次加载/手动重载时全量拉
+    // （since 置空），之后走增量。
+    //
+    // 例外：切走很久再回来时，服务端环形缓冲（500 行）可能已经把中间的旧行
+    // 淘汰掉了——增量只会拿到「还在环里」的那部分，中间缺一段。因此游标超过
+    // LOG_CURSOR_MAX_AGE_MS 就退回全量拉（一次 90KB，换来不缺行）。
+    if (logSinceTs && (Date.now() - logSinceTs.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
+      resetLogWindow();
+    }
+    const lq = logSince ? '?since=' + encodeURIComponent(logSince) : '';
+    const [d, requestRows, credit, errSum] = await Promise.all([
+      api('logs' + lq),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
       api('credit_history?limit=' + creditLimitValue()).catch(() => null),
       api('error_summary').catch(() => null),
     ]);
     // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
     // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
-    // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求。
-    const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
-    const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
+    // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求；
+    // 此时才需要 recent（第一次拉指标时已经知道归档关了，重新取一次带 recent 的）。
+    // shortcut: 归档关闭时这是两次串行请求（默认 archive 开启，只有关掉才多一个 RTT），
+    // 要省就先让 overview 透出 archive.enabled、别为此单独打一次 request_metrics。
+    const recent = archiveOn
+      ? (requestRows.entries || [])
+      : ((await api('request_metrics').catch(() => ({}))).recent || []);
     renderRequestMetrics(metrics, recent);
-    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
-    box.innerHTML = entries.length
+    // 增量合并到本地窗口（增量拉到的行 append；全量拉到的行 replace）。
+    const incoming = d.entries || [];
+    if (logSince) {
+      logRows = logRows.concat(incoming);
+      if (logRows.length > LOG_ROWS_MAX) logRows = logRows.slice(-LOG_ROWS_MAX);
+    } else {
+      logRows = incoming.slice(-LOG_ROWS_MAX);
+    }
+    // 下次增量的起点：本次收到的最后一条的时间戳（同毫秒的多条会被一起带上，
+    // 重复无害——服务端按 After(since) 过滤，同毫秒条目可能重复一次；用
+    // 「已见过的最大 ts」而不是「现在」是对的：不能漏）。
+    for (const e of incoming) {
+      if (e && e.ts && (!logSinceTs || new Date(e.ts) > logSinceTs)) logSinceTs = new Date(e.ts);
+    }
+    logSince = logSinceTs ? logSinceTs.toISOString() : '';
+    const entries = logRows.filter(e => logCh === 'all' || e.ch === logCh);
+    setHTML(box, entries.length
       ? entries.map(e => {
         const lvl = logLevel(e.text);
         const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
         const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
+      : '<span style="color:var(--ink-3)">暂无日志</span>');
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
     const counts = {};
-    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
+    for (const e of logRows) counts[e.ch] = (counts[e.ch] || 0) + 1;
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
@@ -1175,7 +1429,7 @@ function renderCreditHistory(d) {
   }
   const entries = d.entries || [];
   if (note) note.textContent = creditHistoryNote(entries);
-  body.innerHTML = entries.length
+  setHTML(body, entries.length
     ? entries.map(e => '<tr>' +
       '<td>' + esc(creditTimeText(e)) + '</td>' +
       '<td>' + esc(creditAccountText(e)) + '</td>' +
@@ -1183,7 +1437,7 @@ function renderCreditHistory(d) {
       '<td class="num">' + esc(creditBalanceText(e)) + '</td>' +
       '<td>' + esc(creditDescText(e)) + '</td>' +
       '</tr>').join('')
-    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分变动记录</td></tr>';
+    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分变动记录</td></tr>');
 }
 function creditLimitValue() {
   const el = $('creditLimit');
@@ -1238,7 +1492,7 @@ function renderRequestTable() {
   const list = reqEntries.filter(e => reqMatch(e));
   const tb = $('reqBody');
   if (!tb) return;
-  tb.innerHTML = list.map(e => {
+  setHTML(tb, list.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
@@ -1256,7 +1510,7 @@ function renderRequestTable() {
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
   }).join('') || '<tr><td colspan="10" class="empty">' +
-      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>');
 
   const filtered = list.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
@@ -1281,7 +1535,7 @@ if ($('reqOutcome')) $('reqOutcome').onchange = () => {
   renderRequestTable();
 };
 if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
-if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+if ($('btnReqReload')) $('btnReqReload').onclick = () => { resetLogWindow(); loadLogs(); };
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
 if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
@@ -1336,7 +1590,9 @@ $('btnLogPin').onclick = () => {
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
-  checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
+  update_auto_enabled: ['update', 'auto_enabled'], update_auto_time: ['update', 'auto_time'],
+  poll_interval_sec: ['panel', 'poll_interval_sec'],
+  checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
@@ -1348,6 +1604,8 @@ const CFG_MAP = {
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   account_spread_minutes: ['schedule', 'account_spread_minutes'], account_spread_min_gap_seconds: ['schedule', 'account_spread_min_gap_seconds'],
+  balance_refresh_jitter_permill: ['schedule', 'balance_refresh_jitter_permill'], task_sweep_jitter_permill: ['schedule', 'task_sweep_jitter_permill'],
+  night_account_cap: ['schedule', 'night_account_cap'], makeup_cards_per_round: ['schedule', 'makeup_cards_per_round'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -1365,10 +1623,13 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
+  embeddings_enabled: ['features', 'embeddings_enabled'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
   models_hidden: ['models', 'hidden'],
+  models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
+  thinking_enabled: ['thinking', 'enabled'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1405,14 +1666,31 @@ async function loadConfig() {
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
+      // 按模型覆盖档位（对象）：回显成「模型=档位」多行文本，与 textarea 输入同形。
+      else if (v && typeof v === 'object') el.value = Object.entries(v).map(([k, x]) => k + '=' + x).join('\n');
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
+    // 思考档位策略是「三选一单选组」（客户端优先 / 网关优先·只档位 / 网关优先·档位+开关），
+    // 由两个既有配置键（client_priority + override_scope）推导，格式不变、手改配置仍生效。
+    // 无 iterable NodeList 的 DOM 桩（故障注入/老测试）下静默跳过：只影响回显，不影响保存。
+    const mode = thinkingModeOf(cfgLoaded.thinking);
+    try {
+      for (const r of f.querySelectorAll('input[name="thinking_mode"]')) r.checked = r.value === mode;
+    } catch (e) { /* DOM 桩没有 NodeList 迭代器 */ }
     $('cfgKey').disabled = !!d.api_key_env_managed;
     $('cfgKey').title = d.api_key_env_managed ? '访问密钥由启动环境变量设置，请在部署配置中修改。' : '';
     $('cfgNote').textContent = managed.length ? '由启动环境管理：' + managed.join('、') : '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
+// thinkingModeOf 由 thinking.client_priority + override_scope 推导三选一的选中项。
+// 缺省（未写客户端优先）= 客户端优先，与 config 默认值一致。
+function thinkingModeOf(t) {
+  t = t || {};
+  if (t.client_priority !== false) return 'client';
+  return String(t.override_scope || '').toLowerCase() === 'all' ? 'all' : 'level';
+}
+
 function collectConfig() {
   const f = $('cfgForm'), out = {};
   for (const [name, path] of Object.entries(CFG_MAP)) {
@@ -1424,7 +1702,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 逗号/空白分隔的列表字段：空 = 显式清空黑名单（空数组照发，否则删不掉条目）。
-      if (name === 'models_hidden') v = raw.split(/[,，\s]+/).filter(Boolean);
+      // 白名单同款语义（issue #68）：空串显式发空数组 = 关闭白名单。
+      if (name === 'models_hidden' || name === 'models_allowed') v = raw.split(/[,，\s]+/).filter(Boolean);
       // 模型映射（issue #30）："客户端名=真实名" 条目数组，同列表语义；空数组照发 = 清空。
       else if (name === 'models_aliases') v = raw.split(/[,，]+/).map(s => s.trim()).filter(Boolean);
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
@@ -1434,6 +1713,12 @@ function collectConfig() {
     }
     if (v !== undefined) put(out, path, v);
   }
+  // 三选一单选组 → 两个既有键（与 CFG_MAP 互不覆盖：上面只回填了 thinking.enabled）。
+  // 老测试桩没有 querySelector（只铺 elements），缺省按客户端优先回填。
+  const modeEl = typeof f.querySelector === 'function' ? f.querySelector('input[name="thinking_mode"]:checked') : null;
+  const mode = modeEl ? modeEl.value : 'client';
+  put(out, ['thinking', 'client_priority'], mode === 'client');
+  put(out, ['thinking', 'override_scope'], mode === 'all' ? 'all' : 'level');
   return out;
 }
 /* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
@@ -1510,6 +1795,7 @@ function openAdd() {
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('apiKeyDone').hidden = true; $('apiKeyErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  $('addQr').hidden = true; $('addQr').innerHTML = ''; // 上一次的 state 已作废，二维码不留
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   $('btnAddApiKey').hidden = true;
   stopPoll();
@@ -1534,7 +1820,22 @@ function startAddLogin() {
   $('addLoad').hidden = false; $('addErr').hidden = true;
   api('login/start', { method: 'POST', body: JSON.stringify({ site }) }).then(r => {
     loginState = r.state;
+    loginStartAt = Date.now();
     $('addUrl').textContent = r.url;
+    // 手机/异地添加：链接转发常被 IM 预览抓取或截断 state，扫码这条路径不受影响。
+    // 超出编码容量（workbuddy 站带 ww_device_nonce 时 157 字节）就只留链接。
+    try {
+      const M = qrMatrix(r.url);
+      // 模块整数像素（4×）：非整数的 viewBox 缩放会把模块边缘糊成半像素，手机更难扫。
+      $('addQr').innerHTML = qrSVG(M, (M.length + 8) * 4);
+      $('addQr').hidden = false;
+    } catch (e) {
+      // shortcut: 编码器到 v6（134 字节）为止；装了 CODEBUDDY_LOGIN_DEVICE_NONCE 的
+      // workbuddy 站链接 157 字节编不出来，再往上要补版本信息块，那时再升 v8。
+      // 但降级必须说出来 —— 静默不显示二维码会被当成 bug 反复报。
+      $('addQr').innerHTML = '<span class="note">链接过长，无法生成二维码，请用下方「复制链接」或「在浏览器打开」</span>';
+      $('addQr').hidden = false;
+    }
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
@@ -1575,6 +1876,12 @@ async function pollLogin() {
       $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
       invalidatePackages(); // 凭据换新：缓存里的旧 401 行必须作废
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+    }
+    // 浏览器侧一旦显示「登录失败」，这边只会一直 pending 到 15 分钟 TTL，用户盯着
+    // 「等待中」不知道要不要重来。90s 后给一次可操作提示，别让他空等。
+    if (!r.done && loginStartAt && Date.now() - loginStartAt > 90000 && $('addErr').hidden) {
+      $('addErr').hidden = false;
+      $('addErr').textContent = '仍在等待浏览器完成登录。若浏览器已显示「登录失败」，请关闭本窗口重新获取授权链接（链接 15 分钟内有效）。';
     }
   } catch (e) {
     if (e.status === 404 || e.status === 410) {
@@ -1669,22 +1976,51 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+// 页面隐藏时暂停轮询（perf）：浏览器把标签页切到后台时，本页仍然每 5 秒打一轮
+// 接口 + 重建整张表——用户看不到，却照付网络、CPU 与内存代价。visibilitychange
+// 事件在切后台/回前台时触发，这里据此停表与补一次刷新（回前台时数据是旧的，
+// 立即补拉一次比空等一个周期更快）。
+//
+// 代价：无人看时面板数据不更新。这与「自动刷新」的本意不冲突——自动刷新是给
+// 「盯着看」的人用的；真需要无人值守的数据，看服务端 /status 与排程日志。
+let pageHidden = document.visibilityState === 'hidden';
+// pollIntervalMs 自动刷新间隔：缺省 5000ms。服务端 /panel/api/overview 会透出
+// config 的 panel.poll_interval_sec（0 = 缺省，负数 = 关闭自动刷新）——首轮
+// overview 回来后据此重建定时器。账号多或只把面板当监控用时，调大间隔能显著
+// 降低浏览器与服务端负担。
+let pollIntervalMs = 5000;
+let pollAutoRefresh = true;
+document.addEventListener('visibilitychange', () => {
+  const nowHidden = document.visibilityState === 'hidden';
+  if (nowHidden === pageHidden) return;
+  pageHidden = nowHidden;
+  if (pageHidden) {
+    if (refTimer) { clearInterval(refTimer); refTimer = null; }
+    return;
+  }
+  // 回前台：立刻补拉一次当前视图（不等下一个 tick）。
+  refreshVisible();
+  startPolling();
+});
+
 function refreshVisible() {
+  if (pageHidden) return;   // 后台不刷（见上）
   if (view === 'accounts') {
     loadOverview(true);
   }
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') {
-    reattachQueueView();
-    // 补偿状态只在进本视图/手动点击时取数（无 overview 快照，5s 拉一次就是打上游）；
-    // 这里只对缓存做本地重渲染，让截止倒计时继续走动。
-    renderCompensation();
-  }
+  else if (view === 'taskscenter') reattachQueueView();
+}
+// startPolling（重）建轮询定时器。间隔取 pollIntervalMs（服务端配置可调）；
+// pollAutoRefresh=false（配置为负）时不开表——只在用户手动操作时更新。
+function startPolling() {
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+  if (pageHidden || !pollAutoRefresh) return;
+  refTimer = setInterval(refreshVisible, pollIntervalMs);
 }
 function start() {
   loadOverview(true);
-  if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  startPolling();
   checkAuthGate();
 }
 async function checkAuthGate() {
@@ -2448,8 +2784,11 @@ function renderUsage(d) {
   const okRate = reqs ? (reqs - errs) / reqs * 100 : null;
   // 构成条要的是合法 CSS 宽度，usPct 在无样本时返回 "—"，不能直接拼进 style。
   const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
-  // 六张卡：主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
+  // 八张卡：请求数 / 总 token / 积分 / 平均缓存命中率 是四张主指标（同一行，均用强调色），
+  // completion 用成功色（与图表里的绿柱呼应），
   // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
+  const chTok = Number(t.cache_hit_tokens || 0), cmTok = Number(t.cache_miss_tokens || 0);
+  const creditSamples = Number(t.credit_samples || 0);
   $('usStats').innerHTML =
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
@@ -2457,6 +2796,12 @@ function renderUsage(d) {
       'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+    // 积分：按所选窗口累计上游 usage.credit（缺失该字段的历史不参与；样本数为 0 时
+    // 明确写「无积分样本」而不是显示 0 —— 没观测到 ≠ 没消耗）。
+    usKpi(creditSamples ? fmtCredit(t.credits) : '—', '总积分', 'c-accent',
+      creditSamples ? creditSamples + ' 条样本' : '无样本') +
+    usKpi(cacheRateText(chTok, cmTok), '平均缓存命中率', 'c-accent',
+      (chTok + cmTok) ? '命中 ' + fmtTok(chTok) + ' · 未命中 ' + fmtTok(cmTok) : '无缓存观测样本') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
     usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
@@ -2496,6 +2841,7 @@ function renderUsage(d) {
   renderUsageDim();
   renderCreditDim();
   renderUsageChart(usageData.series || []);
+  renderUsageHours(usageData.series || []);
 }
 
 // 维度切换 / 排序控件。
@@ -2532,6 +2878,46 @@ if ($('usSort')) $('usSort').onchange = () => {
  * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
  */
+
+/* renderUsageHours 填「积分与 token 按小时」表：直接消费 series 时序点（hour 点
+   一小时一行、day 点一行代表当天聚合），最新时段排在最上面。此前这张表只有静态
+   表头、没有任何渲染代码，用户永远看到一张空表。token/积分 = 合计 Token ÷ 该时段
+   实测扣除积分（兑换率），没有积分样本的时段留 —，不拿 0 顶替。 */
+function renderUsageHours(series) {
+  const body = $('usHourBody');
+  if (!body) return;
+  const rows = [];
+  for (const p of (series || [])) {
+    if (parsePointTime(p) !== null) rows.push(p);
+  }
+  // 最新时段排最上面。后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse
+  // 对混合窗口会错序，直接按时间戳降序排，与输入顺序解耦。
+  rows.sort((a, b) => parsePointTime(b) - parsePointTime(a));
+  body.innerHTML = rows.map(p => {
+    const tt = Number(p.total_tokens || 0);
+    const cr = Number(p.credits || 0);
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + esc(usHourLabel(p)) + '</td>' +
+      '<td class="num">' + fmtTok(p.requests) + '</td>' +
+      '<td class="num">' + fmtTok(p.prompt_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(p.completion_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(p.total_tokens) + '</td>' +
+      '<td class="num">' + (cr ? fmtCredit(p.credits) : '—') + '</td>' +
+      '<td class="num">' + (cr > 0 && tt > 0 ? fmtTok(tt / cr) : '—') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+}
+
+/* usHourLabel 时段列的完整标签：小时桶「MM-DD HH:00」（跨天窗口下只有 HH:00 分不清
+   是哪天），日桶「MM-DD」。t 的形态判别与 parsePointTime 同口径（长度 13 = 小时桶）。 */
+function usHourLabel(p) {
+  const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return p.t;
+  const day = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+  return p.scope === 'day' ? day : day + ' ' + String(d.getHours()).padStart(2, '0') + ':00';
+}
 
 /* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
 function parsePointTime(p) {
@@ -2791,6 +3177,7 @@ async function loadUsage() {
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
     $('usDimBody').innerHTML = '<tr><td colspan="11" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
+    $('usHourBody').innerHTML = '<tr><td colspan="8" class="empty">读取用量失败</td></tr>';
   }
 }
 
@@ -3297,7 +3684,7 @@ function applyRestToggle(body, expanded) {
 }
 
 // 收纳行展开/收起（与「积分构成」页 pkDetail 同款：查 data 行 + aria-expanded + 改按钮文案）。
-// 监听挂在 tbody 上（渲染替换 innerHTML 不会丢）；到期提醒与官方补偿共用本函数。
+// 监听挂在 tbody 上（渲染替换 innerHTML 不会丢）；到期提醒用本函数。
 // 用户选择写进 restOpen，渲染函数重建 tbody 后调 applyRestToggle 恢复。
 function bindRestToggle(id) {
   const body = $(id);
@@ -3311,10 +3698,9 @@ function bindRestToggle(id) {
   });
 }
 bindRestToggle('expBody');
-bindRestToggle('compBody');
 
-/* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
-   规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+/* ── 精简 QR 编码器（券码 + 登录授权链接用）────────────────────────────
+   规格子集：byte 模式、ECC L、版本 1-6（v6 两块相等，需交织）、固定掩码 0。
    完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
    可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证
    （强制 byte 模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
@@ -3327,10 +3713,12 @@ const QR_EXP = new Array(512), QR_LOG = new Array(256);
 })();
 const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
 
-// 各版本参数（下标 = 版本-1）：[数据码字数, 纠错码字数]，ECC L 单块
-const QR_V = [[19, 7], [34, 10], [55, 15], [80, 20], [108, 26]];
+// 各版本参数（下标 = 版本-1）：[数据码字总数, 每块纠错码字数, 块数]，ECC L。
+// v1-5 单块（免交织）；v6 两块相等各 68 数据字。授权链接约 108 字节，v5 上限 106
+// 差两个字节，正好卡在版本边界上，所以必须补 v6。
+const QR_V = [[19, 7, 1], [34, 10, 1], [55, 15, 1], [80, 20, 1], [108, 26, 1], [136, 18, 2]];
 // 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
-const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30]];
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34]];
 const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
 
 // 生成多项式（最高次系数在前，g[0] 恒为 1）
@@ -3383,8 +3771,8 @@ function qrMatrix(text) {
   // 版本选择：需求 ≈ 2 码字头 + 文本长度，取首个放得下的版本
   let ver = 0;
   for (let v = 0; v < QR_V.length; v++) { if (bytes.length + 2 <= QR_V[v][0]) { ver = v + 1; break; } }
-  if (!ver) throw new Error('QR: text too long (>' + QR_V[4][0] + ' bytes)');
-  const [dataCap, ecCap] = QR_V[ver - 1];
+  if (!ver) throw new Error('QR: text too long (>' + (QR_V[QR_V.length - 1][0] - 2) + ' bytes)');
+  const [dataCap, ecCap, nblk] = QR_V[ver - 1];
   const n = 17 + 4 * ver;
 
   const M = Array.from({ length: n }, () => new Array(n).fill(false));
@@ -3432,7 +3820,13 @@ function qrMatrix(text) {
 
   // 数据码字 + 纠错码字 → 位流
   const dcw = qrDataCodewords(text, dataCap);
-  const cw = dcw.concat(rsRem(dcw, ecCap));
+  // 分块独立算纠错，再按规范交织：先逐列取数据字，再逐列取纠错字（单块时即原顺序）
+  const per = dataCap / nblk;
+  const blk = Array.from({ length: nblk }, (_, i) => dcw.slice(i * per, (i + 1) * per));
+  const ecs = blk.map(b => rsRem(b, ecCap));
+  const cw = [];
+  for (let i = 0; i < per; i++) for (const b of blk) cw.push(b[i]);
+  for (let i = 0; i < ecCap; i++) for (const e of ecs) cw.push(e[i]);
   const bits = [];
   for (const b of cw) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
 
@@ -3540,129 +3934,6 @@ async function loadSchoolVouchers() {
 
 // 按需拉取（移植上游 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
 // 账号一多既慢又压上游。有缓存先直接渲染（标注数据年龄），只有首次进入或显式刷新生效。
-/* ══ 官方补偿（上游 PR #196）：先查状态再领、带截止倒计时 ═══════════════════
-   取数与呈现分离：compData 只在进页面 / 点「检查」 / 点领取后刷新（补偿没有 overview
-   快照，挂进 5s 的 refreshVisible 就是每 5 秒打上游）；倒计时走动靠本地重渲染。 */
-let compData = null;
-const COMP_SOON_MS = 48 * 3600 * 1000;  // ≤48h 标红：补偿过期就真没了
-
-// 上游 end_time 是 "2006-01-02 15:04:05" 无时区字符串，按 +08:00 解释（同 pkExpiryMs）。
-function compEndMs(text) {
-  const t = String(text || '').trim();
-  if (!t) return null;
-  const ms = Date.parse(t.replace(' ', 'T') + '+08:00');
-  return Number.isFinite(ms) ? ms : null;
-}
-
-function compPending(r) {
-  // 布尔化：&& 链对缺字段的行会返回 undefined，进 Number() 变 NaN —— 排序比较器收到
-  // NaN 时 V8 的结果未定义（实测「待领优先」会静默失效），故这里收成 true/false。
-  return Boolean(!r.skip && !r.error && r.active && !r.claimed && (r.credit || 0) > 0);
-}
-
-function compRemainText(ms) {
-  if (ms == null) return '—';
-  const diff = ms - Date.now();
-  if (diff <= 0) return '已截止';
-  const hours = Math.floor(diff / 3600000);
-  if (hours < 48) return hours + ' 小时';
-  return Math.ceil(diff / PK_DAY_MS) + ' 天';
-}
-
-function renderCompensation() {
-  const body = $('compBody');
-  if (!body) return;
-  const rows = (compData && compData.accounts) || [];
-  const now = Date.now();
-  // 待领优先（有操作价值的先露），其余保持池顺序；20 个号一屏铺不下，只展开前 3 行。
-  rows.sort((a, b) => Number(compPending(b)) - Number(compPending(a)));
-  const COMP_HEAD = 3;
-  const rowOf = (r, hidden) => {
-      const who = esc(r.nickname || String(r.uid || '').slice(0, 8));
-      let state = '<span class="tag ok">无活动</span>';
-      if (r.skip) state = '<span class="tag">跳过：' + esc(r.skip_reason || '不适用') + '</span>';
-      else if (r.error) state = '<span class="tag bad" title="' + esc(r.error) + '">查询/领取失败</span>';
-      else if (r.claimed) state = '<span class="tag ok">已领</span>';
-      else if (compPending(r)) state = '<span class="tag warn">待领</span>';
-      const ms = compEndMs(r.end_time);
-      const soon = ms != null && ms - now <= COMP_SOON_MS;
-      const remain = r.end_time
-        ? '<span style="color:' + (soon ? 'var(--bad)' : 'var(--ink-3)') + '">' + compRemainText(ms) + '</span>'
-        : '—';
-      const act = compPending(r)
-        ? '<button class="xs" data-comp="' + esc(r.uid) + '">领取</button>' : '';
-      return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '><td>' + who + '</td><td>' + state + '</td>' +
-        '<td class="num">' + (r.credit ? fmtTok(r.credit) : '—') + '</td>' +
-        '<td class="num">' + remain + '</td>' +
-        '<td class="c-acts">' + act + '</td></tr>';
-  };
-  const rest = rows.slice(COMP_HEAD);
-  body.innerHTML = !rows.length ? '<tr><td colspan="5">未查询（点「检查」）</td></tr>'
-    : rows.slice(0, COMP_HEAD).map(r => rowOf(r, false)).join('') +
-      (rest.length ? '<tr class="pk-group-summary"><td colspan="5">' +
-        '<button type="button" class="pk-group-toggle" data-exp-rest="' + rest.length +
-        '" aria-expanded="false">其余 ' + rest.length + ' 个账号，展开</button></td></tr>' +
-        rest.map(r => rowOf(r, true)).join('') : '');
-  // 重建 tbody 后恢复展开选择（本函数随 5s 轮询重渲染倒计时）。
-  applyRestToggle(body, restOpen.compBody);
-  const pend = rows.filter(compPending);
-  const sum = pend.reduce((n, r) => n + (r.credit || 0), 0);
-  const erred = Number((compData && compData.errored) || 0);
-  // 失败数必须显形：全失败时若只报「没有待领」，等于把故障说成「没活动」。
-  $('compNote').innerHTML = !compData ? ''
-    : (pend.length ? '待领 ' + pend.length + ' 个 · 合计 ' + fmtTok(sum) + ' 积分' : '无待领补偿')
-      + (erred ? ' · <span style="color:var(--bad)">' + erred + ' 个查询失败</span>' : '');
-}
-
-async function loadCompensation() {
-  if (!$('compBody')) return;
-  try {
-    compData = await api('compensation');
-  } catch (e) {
-    compData = null;
-    $('compNote').innerHTML = '<span style="color:var(--bad)">读取失败：' + esc(e.message) + '</span>';
-    return;
-  }
-  renderCompensation();
-}
-
-async function claimCompensation(uid) {
-  try {
-    const r = await api('accounts/' + encodeURIComponent(uid) + '/compensation', { method: 'POST' });
-    if (r && r.error) toast('领取失败：' + (r.skip_reason || r.error), 'bad');
-    else if (r && r.skip) toast('跳过：' + (r.skip_reason || '不适用'));
-    else toast('补偿已领取' + (r && r.credit ? ' +' + r.credit : ''));
-  } catch (e) {
-    toast('领取失败：' + e.message, 'bad');
-  }
-  await loadCompensation();
-}
-
-async function claimCompensationAll() {
-  const btn = $('btnCompAll');
-  if (btn) btn.disabled = true;
-  try {
-    const d = await api('compensation_all', { method: 'POST' });
-    const s = (d && d.summary) || {};
-    // 先看 errored 再看 claimed：上游全挂时 claimed 恒 0，只看 claimed 会把故障说成「没活动」。
-    if (s.errored) toast('补偿：' + s.errored + ' 个账号失败，已领 ' + (s.claimed || 0) + ' 个（+'
-      + (s.credit || 0) + ' 积分）', 'bad');
-    else toast('补偿：已领 ' + (s.claimed || 0) + ' 个（+' + (s.credit || 0) + ' 积分），其余无可领');
-  } catch (e) {
-    toast('全部领取失败：' + e.message, 'bad');
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-  await loadCompensation();
-}
-
-if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
-if ($('btnCompAll')) $('btnCompAll').onclick = claimCompensationAll;
-if ($('compBody')) $('compBody').addEventListener('click', ev => {
-  const btn = ev.target.closest('button[data-comp]');
-  if (btn) claimCompensation(btn.getAttribute('data-comp'));
-});
-
 let lastPackages = null, lastPackagesAt = 0, lastPkLimit = 0;
 
 // invalidatePackages 账号/凭据/余额变更后作废积分构成与到期明细缓存。
@@ -3718,9 +3989,11 @@ function remarkName(uid, nameHtml) {
   const r = remarkOf(uid);
   return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
 }
+// 返回是否真的落盘：localStorage 在隐私模式/配额满时会抛，吞掉就等于「界面说保存了、
+// 刷新后全没了」。调用方必须把 false 报出去。
 function storeRemarks(map) {
   remarksCache = map;
-  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); return true; } catch (e) { return false; }
 }
 
 /* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
@@ -3754,16 +4027,19 @@ function saveRemarkForm() {
     const v = inp.value.trim();
     if (v) map[inp.getAttribute('data-uid')] = v;
   });
-  storeRemarks(map);
+  const saved = storeRemarks(map);
   closeRemarks();
   // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
   if (view === 'accounts') loadOverview(true);
   else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast('备注已保存（仅本机浏览器）');
+  toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
-if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => {
+  if (!storeRemarks({})) toast('清空未能写入浏览器存储，刷新后备注会回来', 'err');
+  renderRemarkBody();
+};
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* 账号身份色板（8 槽）。槽位 0 = var(--accent)（**主题主色**，浅色主题下
@@ -4547,3 +4823,173 @@ function fmtTokens(n) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + ' 万';
   return String(n);
 }
+
+
+/* ── 请求事件日志 (Keeper 风格大屏) ────────────────────────────────── */
+let rawEventsData = [];
+
+async function loadEvents() {
+  const tb = $('eventTableBody');
+  const limit = ($('eventFilterLimit') && $('eventFilterLimit').value) || 100;
+  try {
+    const res = await api('request_logs?limit=' + limit);
+    rawEventsData = res.entries || [];
+    populateEventFilterOptions(rawEventsData);
+    renderEventTable();
+  } catch (err) {
+    // 不能把失败渲染成「共 0 条事件」——归档没开和查询出错是两回事，用户得知道是哪种。
+    rawEventsData = [];
+    if ($('eventBadge')) $('eventBadge').textContent = '读取失败';
+    if (tb) setHTML(tb, '<tr><td colspan="13" style="text-align:center;padding:20px;color:var(--err);">' +
+      (err.status === 501 ? '请求归档未开启，事件日志不可用' : '读取失败: ' + esc(err.message || String(err))) + '</td></tr>');
+  }
+}
+
+function populateEventFilterOptions(list) {
+  const modelSel = $('eventFilterModel');
+  const acctSel = $('eventFilterAccount');
+  if (!modelSel || !acctSel) return;
+  const currModel = modelSel.value;
+  const currAcct = acctSel.value;
+
+  const models = new Set();
+  const accts = new Set();
+  list.forEach(e => {
+    if (e.model) models.add(e.model);
+    if (e.account) accts.add(e.account);
+  });
+
+  let mOpt = '<option value="">全部 (' + models.size + ')</option>';
+  models.forEach(m => mOpt += '<option value="' + esc(m) + '"' + (m === currModel ? ' selected' : '') + '>' + esc(m) + '</option>');
+  setHTML(modelSel, mOpt);
+
+  let aOpt = '<option value="">全部 (' + accts.size + ')</option>';
+  accts.forEach(a => aOpt += '<option value="' + esc(a) + '"' + (a === currAcct ? ' selected' : '') + '>' + esc(a) + '</option>');
+  setHTML(acctSel, aOpt);
+}
+
+function renderEventTable() {
+  const tb = $('eventTableBody');
+  if (!tb) return;
+  const modelFilter = ($('eventFilterModel') && $('eventFilterModel').value) || '';
+  const acctFilter = ($('eventFilterAccount') && $('eventFilterAccount').value) || '';
+  const statusFilter = ($('eventFilterStatus') && $('eventFilterStatus').value) || '';
+
+  let filtered = rawEventsData.filter(e => {
+    if (modelFilter && e.model !== modelFilter) return false;
+    if (acctFilter && e.account !== acctFilter) return false;
+    if (statusFilter === 'success' && !(e.ok || (e.status >= 200 && e.status < 300))) return false;
+    if (statusFilter === '429' && e.status !== 429) return false;
+    if (statusFilter === 'error' && (e.ok || (e.status >= 200 && e.status < 300))) return false;
+    return true;
+  });
+
+  if ($('eventBadge')) $('eventBadge').textContent = '共 ' + filtered.length + ' 条事件';
+
+  if (!filtered.length) {
+    setHTML(tb, '<tr><td colspan="13" style="text-align:center;padding:30px;color:var(--ink-3);">没有符合筛选条件的请求事件</td></tr>');
+    return;
+  }
+
+  const html = filtered.map(e => {
+    const d = new Date(e.time);
+    const tStr = isNaN(d) ? '-' : (String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0'));
+    const dStr = isNaN(d) ? '' : (d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate());
+
+    const acctRaw = e.account || '-';
+    const acctClean = acctRaw.replace(/\([^)]*\)/, '');
+    const mName = e.model || '-';
+    const effort = e.reasoning_effort || '-';
+
+    let resTag = '<span class="tag-badge tag-success">成功</span>';
+    if (e.status === 429) {
+      resTag = '<span class="tag-badge tag-warn">429 限流</span>';
+    } else if (e.status && (e.status < 200 || e.status >= 300)) {
+      resTag = '<span class="tag-badge tag-error">' + e.status + ' 错误</span>';
+    }
+
+    const reqProto = (e.mode === 'stream' || (e.path && e.path.includes('responses'))) ? 'SSE' : 'POST';
+    const reqPath = (e.path || '/chat').replace(/^\/v1/, '');
+
+    const durSec = ((e.duration_ms || 0) / 1000).toFixed(1) + 's';
+    const ttfbSec = e.ttfb_ms ? '首字延迟 ' + ((e.ttfb_ms) / 1000).toFixed(1) + 's' : '-';
+
+    let tpsStr = '-';
+    if (e.completion_tokens > 0) {
+      const genMs = Math.max(100, (e.duration_ms || 0) - (e.ttfb_ms || 0));
+      tpsStr = ((e.completion_tokens / genMs) * 1000).toFixed(1) + ' t/s';
+    }
+
+    const totTok = formatEventNum(e.total_tokens || 0);
+    const pTok = formatEventNum(e.prompt_tokens || 0);
+    const cTok = formatEventNum(e.completion_tokens || 0);
+    const thinkTok = e.reasoning_tokens > 0 ? ('<span class="tok-think" title="思考 Token">🧠 ' + formatEventNum(e.reasoning_tokens) + '</span>') : '';
+
+    const cHit = e.cache_hit_tokens || 0;
+    const cMiss = e.cache_miss_tokens || 0;
+    const cTot = cHit + cMiss;
+    const cRate = cTot > 0 ? ((cHit / cTot) * 100).toFixed(2) + '%' : '-';
+
+    const exec = e.executor_type || deriveEventExecutor(e.user_agent);
+    const ip = e.client_ip || '-';
+    const ua = e.user_agent || '-';
+
+    return '<tr>' +
+      '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
+      '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
+      '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
+      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
+      '<td>' + resTag + '</td>' +
+      '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
+      '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
+      '<td><div class="metric-main">' + esc(tpsStr) + '</div></td>' +
+      '<td class="token-cell"><div class="tok-total">' + esc(totTok) + '</div><div class="token-breakdown"><div class="token-breakdown-row"><span class="tok-in">↑ ' + esc(pTok) + '</span></div><div class="token-breakdown-row"><span class="tok-out">↓ ' + esc(cTok) + '</span> ' + thinkTok + '</div></div></td>' +
+      '<td class="cache-cell"><div class="cache-rate">' + esc(cRate) + '</div><div class="cache-breakdown"><div><span class="cache-hit">命中 ' + esc(formatEventNum(cHit)) + '</span></div><div><span class="cache-miss">未命中 ' + esc(formatEventNum(cMiss)) + '</span></div></div></td>' +
+      '<td><span class="executor-name">' + esc(exec) + '</span></td>' +
+      '<td><code class="ip-mono">' + esc(ip) + '</code></td>' +
+      '<td><div class="ua-cell" title="' + esc(ua) + '">' + esc(ua) + '</div></td>' +
+    '</tr>';
+  }).join('');
+
+  setHTML(tb, html);
+}
+
+function formatEventNum(n) {
+  if (!n || n < 0) return '0';
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(2) + 'K';
+  return String(n);
+}
+
+function deriveEventExecutor(ua) {
+  if (!ua) return 'WorkBuddyExecutor';
+  const l = ua.toLowerCase();
+  if (l.includes('antigravity')) return 'AntigravityExecutor';
+  if (l.includes('codex')) return 'CodexExecutor';
+  if (l.includes('claude')) return 'ClaudeCodeExecutor';
+  if (l.includes('cursor')) return 'CursorExecutor';
+  if (l.includes('continue')) return 'ContinueExecutor';
+  if (l.includes('openai') || l.includes('python')) return 'OpenAIClient';
+  return 'WorkBuddyExecutor';
+}
+
+if ($('eventFilterModel')) $('eventFilterModel').onchange = renderEventTable;
+if ($('eventFilterAccount')) $('eventFilterAccount').onchange = renderEventTable;
+if ($('eventFilterStatus')) $('eventFilterStatus').onchange = renderEventTable;
+if ($('eventFilterLimit')) $('eventFilterLimit').onchange = loadEvents;
+if ($('btnEventClearFilters')) $('btnEventClearFilters').onclick = () => {
+  if ($('eventFilterModel')) $('eventFilterModel').value = '';
+  if ($('eventFilterAccount')) $('eventFilterAccount').value = '';
+  if ($('eventFilterStatus')) $('eventFilterStatus').value = '';
+  renderEventTable();
+};
+if ($('btnEventRefresh')) $('btnEventRefresh').onclick = loadEvents;
+if ($('btnEventExport')) $('btnEventExport').onclick = () => {
+  const blob = new Blob([JSON.stringify(rawEventsData, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'request-events-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+};

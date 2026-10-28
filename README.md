@@ -144,7 +144,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
-| **官方补偿（先查后领 + 倒计时）** | 面板「官方补偿」卡片：`POST /billing/meter/compensation-status` 查状态（`active && !claimed && credit_num>0` 才领），带领取截止倒计时（≤48h 标红）与逐号 / 全量领取按钮。补偿带截止日，此前签到排程里的**盲领**把「无补偿 / 已领过」打成假的 `+0c` 成功行、真失败静默；现在无待领静默、失败在卡片与日志上显形，查询失败的账号也照样占一行（不把「查不到」显示成「没有」） |
+| **新手礼包（先查后领 + 倒计时）** | 面板「新手礼包」卡片：`POST /billing/meter/check-gift-claimed` 查状态（**无 `/v2` 前缀**，带 `/v2` 是 404；`active && !claimed && credit_num>0` 才领），带领取截止倒计时（≤48h 标红）与逐号 / 全量领取按钮。礼包带截止日，此前签到排程里的**盲领**把「无礼包 / 已领过」打成假的 `+0c` 成功行、真失败静默；现在无待领静默、失败在卡片与日志上显形，查询失败的账号也照样占一行（不把「查不到」显示成「没有」）。<br>**官方补偿链路已于 2026-10 活动结束后整体下线**（`upstream` 状态查询 + `ClaimCompensation`、scheduler 的 `CompensationRow` / `CompensateOne`、面板三个端点与卡片、相关测试全删）；新手礼包与补偿同坑同纪律，保留并改名 `benefit*.go`（`CompensationStatus` → `BenefitStatus`） |
 | **模型繁忙度（面板）** | 「模型与档位」列出官方 `/v2/chat/busy` 的实时繁忙度（idle/normal/busy/congested/unavailable），只在 `繁忙 / 拥堵 / 不可用` 时挂色标——它解释了 chat 侧偶发的 429 / 6021 queue.full。**只读观测**：不参与选号；服务端偶发对整批回 `unknown`（实测同批重查可在 idle/unknown 间跳），故取不到就不标 |
 | **联网检索（官方 agenttool）** | `POST /v1/search` 透传官方 `{base}/agenttool/v1/search`（`{query,max_results}` → `{results[].title/url/snippet/date,total_results}`，查询免费；对 DSH（DeepSeek Harness，按 UA 含 `deepseek-harness` 识别）额外启用 DeepSeek Search API 兼容：接受 `count` 作为条数，`date` 缺失时补 `null`、`title`/`snippet` 缺失时补空串；其余客户端保持上游原文逐字节透传）；同一 base 还提供 `POST /v1/fetch`（`{"url":"https://…"}` → `{"content":"<markdown>"}`，透传官方 `agenttool/v1/webfetch`）；加 `"deep":true` 则改走官方**综述式**检索 `agentic_search`（服务端多轮检索 + 抓页 + 带引用综述，回 `done` 帧原文：`synthesis.content` + `results` 整页正文 + `statuses` + `partial` 降级标记）——实测单次 18~66s、prompt ~48K tokens，故默认走 snippet 快路径（~1s）。另在 `/v1/messages` 与 `/v1/responses` 上落地服务端联网工具：客户端（Claude Code / Codex）只声明 `{"type":"web_search_20250305","name":"web_search"}`（或 Responses 的托管 `{"type":"web_search"}`），网关侧先让模型自己写检索词（探测）、执行检索、把结果注入上下文，再走既有流式管道出答案。Anthropic 侧按协议回报 `server_tool_use` + `web_search_tool_result` 块（含来源 URL，且**不**降级成客户端可执行的 `tool_use`）；没声明该工具的请求零额外开销；检索失败如实告知模型（不静默当成「网上没有」），联网不可用则降级为普通对话 |
 | **成长任务队列每日排程** | `schedule.growth_hours`（默认 `[11]`）+ `schedule.growth_enabled`：面板任务中心的执行队列按排程每日自动跑一遍（扫描待办 → accept → 动作 → 达标领奖），与手动入口共用同一队列与账号锁；`POST /admin/tasks/growth/run` 可手动补跑 |
@@ -161,7 +161,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖，见下文） |
 | **零输出守卫** | 上游「收下请求却零输出」（HTTP 200 + `finish_reason=length` + 正文/思考/工具全空，典型成因：输入越过模型**真实**窗口，声明的 `context_length` 被虚报）此前被当成一次成功：客户端拿到空正文，网关零日志零计数，下一次照旧挑同一个号撞同一面墙。现在流式在**写出第一个字节之前**判出来（首帧否决窗口延长到首个**可见输出**帧，role 帧不提交响应头）→ 换号重发一次，客户端完全无痕；非流式在聚合体上判定，同样重发一次。全池都撞则如实回 `502 zero_output_length` + 可行动 hint（缩短输入 / 调大 `max_tokens`），**不罚账号、不冷却**（这是请求形态问题，不是账号健康问题） |
-| **整体不可用模型提升** | 11102「该后端无此模型」原是逐账号负缓存：模型整体下架时每个号都要白撞一次，期间 `/v1/models` 照旧列出它。现在同一 realm 有 **≥2 个不同账号**都被上游明确回 11102 → 记为整体不可用（**只凭上游阳性证据，绝不从「远端目录里没有」反推**；11158「号型不允许」是账号权限差异，不参与提升）→ `/v1/models` 不再列出、点名调用在打上游之前 `400 model_unavailable` 指去换模型；面板「整体不可用模型」单列一张表（与「模型锁池」分清：那是限流等就有，这是等不到），给命中账号数 / 复检时刻 / 上游原话 + 逐条与一键恢复（恢复同时清掉各号的 11102 负缓存，否则「恢复了但请求永远挑不到号」）。24h 自动复检，随 `state.json` 持久化 |
+| **模型锁池全清单（`/panel/api/model_locks`）** | 逐 (域, 模型) 回答「此刻一共哪些模型不能用、分别锁了几个号、还要锁多久」：`total` / `servable` / `locked` 三列 + `state`（`locked` 全池被该模型挡住 / `starved` 没号能服务但不是模型冷却 / `partial` 部分锁）+ `unlock_at` / `fully_unlock_at` / `reason`（取最早解锁账号的上游原文）。口径与选号、`ModelBlocked` 严格一致：只看**参与选号**的账号（禁用/暂停号跳过）、只看**真正拦路由**的冷却（AuditOnly 台账既不出行也不计入）。面板「模型锁池」按不可用优先排序。<br>**注意（README 更正）**：本仓**没有**「同一 realm ≥2 个不同账号都被 11102 → 记为整体不可用」的跨账号提升、也**没有** `/v1/models` 摘除与 24h 复检——11102 目前是逐 (账号, 模型) 负缓存（2m 起指数退避、封顶 10m），跨账号提升属待做 |
 | **账号备份 / 迁移（未实现，待做设计）** | 面板「添加账号 → 备份 / 迁移」：导出为自包含快照（凭据原文 + 备注 + realm + 企业 id + device token），支持**逐个勾选**子集；可选口令加密，**加密在浏览器侧完成**（PBKDF2-SHA256 200k + AES-GCM），口令与明文都不经过网关落盘与日志。导入两种模式取**白名单**（未知值一律 400，不静默回落）：`merge` **只增加**——池中已有的 uid 一个字节都不写（从别人的老备份导入不会用陈旧 token 打断本机活跃号）；`replace` 覆盖/新增，但**快照外的账号一律保留**（刻意不提供「整体替换」，删凭证不可逆）。判重三层：池内 uid → 文件内重复 uid → 规范化（trim + 小写）后重复。备份**不含**本机配置、模型黑名单、保留积分阈值、排程与告警设置，导出文件里用 `note` 写清这条。**当前 main 上没有这个实现**（全树无 PBKDF2 / AES-GCM / `crypto.subtle`，账号导入只有 cockpit 格式一条路），别按这行去面板里找按钮；眼下迁移账号用 `auths/` + `data/` 目录搬迁（见「账号管理」与「凭据管理（auths）」两节） |
 
 ### 同步上游
@@ -180,6 +180,34 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
 未吸收（明确不做）：脚本体系（task_runner 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
+
+**第三轮（`ea8b1e5` → `49f9db4`，2026-10-28，整批 68 个提交）**：冲突按「本仓证据优先、上游理由照收」解（`client.go` / `client_test.go` 两处，均在 CN 三个 base 的注释上，结论本就一致）。
+
+| 上游改动 | 吸收内容 |
+|---|---|
+| 刷新令牌失效 ≠ 账号死（#83） | `refresh` 恒回 12153 但 AT 未过期的账号不再被 3 轮保活后**永久禁用**：判据收敛到 `SessionDeadButUsable`（只看 AT 是否有效），保活降为 INFO 不打 WARN。生产实测 29 个号里 4 个属此类，旧逻辑面板一片橙色「疑似登录失效」而对话秒回 |
+| 会话粘性 `touch` 改 CAS | 快路径 `RUnlock`→加写锁的窗口里，Unbind / Bind / 重分配都可能已改写绑定；无条件回写会复活刚解绑的失败号、把粘性跟随的成功号冲回旧号，镜像进 Redis 后重启都恢复错绑定 |
+| 首帧否决补「200 内嵌 `{code,msg}` 失败帧」 | 11140 审核拦截 / 6021 队列满这类**可重试**失败恰为首帧时响应头已提交 200，无痕换号通道走不到。补 `StreamErrorFrame` 同口径判定 |
+| 全池配额锁（6004/6000）直接回 429 且不发 `Retry-After` | 客户端把它当「睡多久」指令（codebuddy CLI 直接 `delayMs = retry-after×1000` 且不看上限），20 分钟冷却 = 20 分钟静默挂起。清一色配额锁时回 429 + 上游业务码 + 原文；混因仍走原分流；14003 可重试分支的 `Retry-After` 封顶 600s |
+| 429 code 6020 `queue.waiting` 与 6021 同判渠道级排队 | 此前落 `ErrSoftRate` 兜底，几秒排队被当成账号级限流冻 600s（10-24 实案：单次 6020 整号 CoolSoft 10 分钟、同号其他模型一并不可调度）。现与 6021 同判 `ErrUpstreamBusy`：不罚号、不轮转、末端 503 透传原文 |
+| 11102 负缓存 TTL 6h/24h → 2m/10m | 11102 不总是「这号真没这模型」（路径级 / 瞬时抖动 / 分类误判都给同码），旧参数把一次误判放大成 (账号,模型) 锁死 6 小时，多号轮一圈就是整池该模型 503；实测同账号两分钟就恢复。退避保留（Hits 指数到 10m 封顶） |
+| 人味化抖动（10-24 风控复盘） | 6 个账号 3 分钟内被 `request illegal / 账号存在异常行为` 集中封禁，日志显示同出口 IP 上全部账号以完全一致节拍活动。新增 `schedule.balance_refresh_jitter_permill` / `task_sweep_jitter_permill`（0–500，默认 0）+ `night_account_cap`（夜猫子只取积分 Top-N）。**全部缺省关闭，旧行为逐字不变**；抖动对单进程实例稳定（种子 = 启动时间） |
+| 身份句式整句中性化 | 原先只换品牌词，`You are … powered by …` 的**骨架本身也是特征**。新增 `sanitizeIdentitySentenceRe`（You are + ≤3 修饰词 + 可选名词 + 七种动词搭配 → 中性句），窗口有界所以 `You are free to use tools built by …` 不被误伤 |
+| 11-128 抢救升级为「搬家」 | 新增 `prompt.MoveSystemToUser`：把 system 原文搬进首条 user，**只换承载通道、一个字符不丢**（旧实现用中性提示词替换，客户端写的人设 / 项目约定全没了）。搬不动才退回整体替换；成功后置降级态，后续请求直接按搬家形态出站，不再每条都先撞一次 400 |
+| DSH `@` 路径段改写 | `workspace root` → `project root`（两种上游说法下都安全、与 DSH 语义等价） |
+| 工具 schema 的 `enum` 缺 `type` 补推断类型 | Kimi 系严格校验，属性只写 enum 不写 type 直接 400 `11133`，而 DSH 的整套工具定义里就有这种写法 → 该模型对 DSH 等于全废。能无损推断才补（全串 string / 全整数 integer / 含小数 number / 全布尔 boolean），混合标量或含 null 保持原样不猜；`response_format` 不走这条 |
+| 网关思考档位策略（PR #104–#106） | `config.thinking`：`client_priority`（客户端优先 = 只在缺档时补默认；网关优先 = 一律改写）+ `override_scope`（`level` 只覆盖档位、尊重客户端主动关闭；`all` 连关闭也改写）+ `default_effort`（`max` = 模型支持的最高档）+ `model_defaults`（`cn:xxx` / `global:xxx` 精确到域、裸名两域共用、`inherit` 不覆盖）。`/v1/models` 的 `reasoning_default_effort` 改写成**网关实际生效档**（否则客户端预填 high 会抵消网关补档），`can_disable_thinking` 的模型在档位表追加 `off`；请求流水新增 `effort` 列 |
+| 模型白名单 `models.allowed`（#68） | 与 `hidden` 完全对称，四生效点收敛到一个 `allowedModel()` 谓词（cn 列表 / global 列表 / 出图单列 / 点名拒绝），顺序在**别名映射之后、黑名单之前**（`Allowed ∩ Hidden`）；`/v1/capacity` 也归零（信息面不成为绕过口），拒绝文案不区分「不存在」与「未在白名单」以免枚举 |
+| `POST /v1/embeddings`（实验，默认关） | 上游 `/v2/embeddings`，与对话是两套注册表（`/v3/config` 不含嵌入模型），实测只有 `bge-m3`（1024 维）。`11351` → 404 `model_not_found`；回程补 `object`/`index`；**条数不符一律 502**（向量错位比报错更难查）；关着回 403 `embeddings_disabled` 而非 404 |
+| 一键更新 + 版本检测 | 新包 `internal/updater`：只认时间版本格式的正式 Release、`SHA256SUMS` 校验、`isTrustedGitHubURL`、zip 路径穿越防护；下载改「无整体超时 + 响应头 30s + `stallGuard` 30s 无进展才掐」（原 30s 整体超时覆盖全程，300MB 慢网必挂）；`waitChildHealthy` 8s 健康观察窗（原新进程拉起即删回滚备份，配置不兼容 / 端口占用会直接瘫死）；`armInstallWatchdog` 90s；自动安装改窗口式判定（原「分钟精确相等」会被 ticker 相位漂移静默丢掉）。**`appRepository` 指向本仓**，见下 |
+| 官方补偿整条链路下线 | 活动 2026-10 结束：移除 `upstream` 状态查询 + `ClaimCompensation`、scheduler 的 `CompensationRow` / `CompensateOne`、面板三端点与卡片、相关测试。**新手礼包保留**并改名 `benefit*.go`（`CompensationStatus` → `BenefitStatus`）——同一个坑、同一份「先查状态、待领才领」纪律 |
+| 补签卡每轮上限 | `schedule.makeup_cards_per_round`（默认 `0` = 不限，保持既有行为）。补签会改账号历史，保守部署设 `1` 即每轮只补一张，剩余漏签下一轮继续 |
+| 面板 | 请求事件日志大屏（`#events`，14 列 + 执行器智能归因 + JSON 导出）、扫码登录二维码、用量总积分卡、平均缓存命中率主指标卡、资源占用优化（后台标签暂停轮询 / 日志增量拉 / 未变化跳过重绘）、模型行内「下游可见」开关与「网关档位」下拉、配置页补齐抖动与夜猫子上限 |
+| 一批正确性与稳定性修复 | 12153 中间计数与清零点置脏落盘（重启误杀刚自证账号）；`/v1/models` 兼容 Anthropic `x-api-key`；五个手动全量接口防重入（双击 = 两轮全量并发逐号打上游）；`/panel/api/models` 服务端短缓存；弱 `api_key` + 非回环监听启动告警；**默认 `listen` 从 `:7863` 改 `127.0.0.1:7863`**（docker-compose 显式 `WB2A_LISTEN=0.0.0.0:7863`）；优雅关停窗口可配（原硬编码 5s 会把在途 SSE 掐成连接重置，且 `Shutdown` 错误被 `_ =` 吞）；三处 `log.Fatalf` 前先落盘池状态；账号禁用 / 熔断 / 降权迁移留痕；`usage.json` 落盘失败可重试；reqlog 归档查询窗口短路；粘性恢复改 MGET；arm64 `parseUsageTotalTokens` 越界守卫改 float 比较；`TestChatStreamPassthrough` 的 TTFB 竞态（假上游加 3ms 首字节延迟，否则 Windows 时钟粒度让它随机为 0、速率不可测而误红） |
+
+> **一键更新必须指向本仓**：`cmd/server/main.go` 的 `appRepository` 是**自己的仓库**。updater 下载的是该仓库 Release 里的 `wb2api-panel-<ver>-<goos>-<goarch>.zip`，并直接把正在运行的二进制换掉（`replaceBinaryWithRollback`，回滚只留一个 `.old`，健康检查过了就删）。指向别人等于让别人覆盖本分支的全部独占改动。现由 CI 用 `-X main.appRepository=${GITHUB_REPOSITORY}`、Docker 用 `ARG APP_REPOSITORY` 注入「谁构建就跟随谁」，本地构建回落本仓常量。
+
+**未吸收（第三轮）**：上游把 README 从 799 行砍到 133 行（架构总览、快速开始、配置说明、核心行为语义、API 端点、部署运维、安全与合规、常见问题、关键断言均被删且无别处承接）——**本仓保留完整版**，只把新能力补进上表。
 
 ### 未做 / 待办
 
@@ -449,6 +477,21 @@ curl -s http://localhost:7863/v1/responses \
 | `schedule.growth_enabled` | `true` | 成长任务队列排程总开关（`false` = 不自动跑，任务中心手动入口照旧） |
 | `schedule.task_sweep_enabled` | `true` | 补领清扫总开关：周期 accept 待接受的、claim 已达标未领的（不跑行为链路），兜住成长队列一天一轮 + `autoActions` 白名单外的漏领 |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫间隔（分钟）；`<=0` 回落 15 |
+| `schedule.balance_refresh_jitter_permill` | `0` | 余额刷新的间隔抖动（0–500 千分比，`0` = 精确固定间隔，与旧行为一致）。10-24 风控复盘：6 个账号 3 分钟内被 `request illegal` 集中封禁，日志显示同出口 IP 上全部账号以完全一致节拍活动。打开后每轮间隔在 ±(值/1000)×基准 内稳定随机偏移，并把账号遍历摊开到同量级窗口（逐号逐轮独立偏移，消除「同一秒全池同动作」）。对单进程实例稳定（种子 = 启动时间），重启换新值 |
+| `schedule.task_sweep_jitter_permill` | `0` | 补领清扫的间隔抖动（0–500 千分比，`0` = 与旧行为一致），语义同上 |
+| `schedule.night_account_cap` | `0` | 夜猫子参与上限（`0` = 不限，旧行为）。设为 N 时候选收窄为**积分最高的前 N 个账号**——夜间流量集中到少数号，其余号夜里静默（真人不会全部账号都在夜里有活动）。白天任务（签到 / 旅行 / 成长）仍全池保号，不受影响 |
+| `schedule.makeup_cards_per_round` | `0` | 每轮补签卡上限（`0` = 补到卡用光，旧行为）。补签是**改账号历史**的写操作，保守部署设 `1` 即每轮只补一张，剩余漏签下一轮继续（有日志） |
+| `models.allowed` | `[]` | 模型白名单（issue #68）：条目语法同 `hidden`（裸名两域、`cn:`/`global:` 只该域）；空 = 不启用（默认放行全部）。非空时**只有白名单内模型**可列出与调用，与 `hidden` 共存取交集（白名单圈定可能可见集合，黑名单再从中剔）。顺序在别名映射之后、黑名单之前，`/v1/capacity` 同步归零。面板模型页每行的「下游可见」开关直接增删 `hidden`，热生效 |
+| `thinking.enabled` | `true` | 网关思考档位策略总开关。`false` = 完全不碰档位，行为退回只有 `injectThinking` + 降级的旧管线 |
+| `thinking.client_priority` | `true` | `true` 客户端优先：客户端发了档位就照单全收（含关闭思考），只在**没发**档位时补 `default_effort`；`false` 网关优先，客户端显式档位一律改写为网关目标档 |
+| `thinking.override_scope` | `level` | 仅 `client_priority=false` 时有意义：`level` = 只覆盖档位、尊重客户端主动关闭思考；`all` = 连 `off`/`disabled` 也改写成开启 + 目标档 |
+| `thinking.default_effort` | `max` | 网关目标档。`max` 解析为模型支持的最高档；写具体档位（`high`/`xhigh`/`medium`/`low`/`minimal`）时模型不支持则落到**不高于它的最高支持档** |
+| `thinking.model_defaults` | `{}` | 按模型覆盖目标档：键 `cn:模型名` / `global:模型名` 精确到域、裸名两域共用，值可为具体档位或 `off`（该模型固定关闭思考，只对 `canDisableThinking` 的模型有效）；`inherit` = 不覆盖。面板「模型与档位」页每行的「网关档位」下拉直接写本表，保存后热生效 |
+| `features.embeddings_enabled` | `false` | 实验特性 `POST /v1/embeddings` 开关。关着时端点仍在但回 **403 `embeddings_disabled`**（不是 404——功能存在，只是没开）。上游走 `/v2/embeddings`，与对话是两套注册表，实测只有 `bge-m3`（1024 维）可用 |
+| `update.auto_enabled` | `false` | 每日自动检查**并安装**原生 Release。默认关。**注意 `appRepository` 必须是本仓**，否则一次自动更新就会用别人的构建覆盖本分支的独占改动 |
+| `update.auto_time` | `04:00` | 自动更新时间（`HH:MM`，Asia/Shanghai）。判定是**窗口式**（今天没跑过且已到/过目标时刻），不是分钟精确相等——后者会被 ticker 相位漂移静默丢掉 |
+| `watchdog.enabled` | `false` | 上游目录改版监控：定期对 `/v1/models` 的结果取指纹（排序后 sha256，与顺序无关，任一字段变化就变），变了经 `alerting.webhook_url` 推送；未配 webhook 时只写日志。复用网关自己维护的 `modelList()`，**零新增上游调用**，盯的正是客户端真正拿到的那份数据（含白名单/隐藏过滤后的结果）。首轮只建基线不通知 |
+| `watchdog.interval_seconds` | `3600` | 目录指纹比对间隔（秒）。目录变化是低频事件，一小时一次足够 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限；改动需重启 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限；改动需重启（它也是「轮转最坏耗时」的分母：单请求最坏 ≈ 本值 × 换号次数） |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流）；改动需重启 |

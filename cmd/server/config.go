@@ -15,11 +15,12 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
+	Listen    string `json:"listen"`     // "127.0.0.1:7863"（缺省只绑回环）
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
@@ -32,7 +33,18 @@ type Config struct {
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
+		// PollIntervalSec 面板自动刷新间隔（秒）。0 = 用前端缺省（5s）；
+		// 负值 = 关闭自动刷新（只在手动操作时更新）。账号多、或只是开着面板
+		// 当监控用时，调大间隔能显著降低浏览器与服务端负担。
+		PollIntervalSec int `json:"poll_interval_sec"`
 	} `json:"panel"`
+
+	Update struct {
+		// AutoEnabled 每日按上海时间自动检查并安装原生 Release。
+		AutoEnabled bool `json:"auto_enabled"`
+		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
+		AutoTime string `json:"auto_time"`
+	} `json:"update"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -58,6 +70,10 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// ShutdownTimeout 优雅关停窗口（SIGTERM / 更新重启时，等在途请求排干的
+		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
+		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
+		ShutdownTimeout string `json:"shutdown_timeout"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -135,6 +151,30 @@ type Config struct {
 		// autoActions 白名单外的任务——它们此前除了手动一键完成没有任何补领路径。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// 周期抖动（人味化，anti-fingerprint）：>0 时余额刷新/补领清扫的每轮间隔
+		// 在 ±（值/1000）×基准间隔内随机偏移，不再精确固定间隔打卡；余额刷新
+		// 另把账号遍历摊开到同量级窗口内（见 internal/scheduler/humanize.go）。
+		// 0 = 关闭（旧行为：精确 interval ticker + 全账号并发齐射）。上限 500 = 50%。
+		// 例：balance_refresh_minutes=5 + 200 → 实际间隔在 3–7 分钟之间抖。
+		BalanceRefreshJitterPermill int `json:"balance_refresh_jitter_permill"` // 缺省 0；0–500
+		TaskSweepJitterPermill      int `json:"task_sweep_jitter_permill"`      // 缺省 0；0–500
+
+		// 夜间参与上限（人味化）：夜猫子（23:00–08:00 真实模型对话）等夜间任务的
+		// 参与账号收窄为积分最高的前 N 个，0 = 不限（旧行为全池参加）。背景：
+		// 深夜全池 12 个号在同一出口 IP 齐做真实对话，是最好认的机器人形状；真人
+		// 不会全部账号都在夜里有活动。夜猫子是唯一「整任务都是真实模型对话」的
+		// 任务，指纹最重，故只收窄它；白天任务（签到/旅行/成长）仍全池保号。
+		NightAccountCap int `json:"night_account_cap"` // 缺省 0（不限）；>0 = Top-N 按积分
+
+		// MakeupCardsPerRound 每轮连登管家最多用几张补签卡，0 = 不限（补到卡用光，
+		// 即 2026-10 之前的行为）。
+		//
+		// 为什么留一个上限：补签是**会改账号历史**的写操作，一次把当月漏签全补齐
+		// （对照实现 workbuddy-scheduled-tasks 的策略是「每轮最多 1 张」，理由写明
+		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
+		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
+		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
 	} `json:"schedule"`
 
 	Global struct {
@@ -157,10 +197,10 @@ type Config struct {
 
 	CN struct {
 		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
-		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
-		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
-		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
-		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		// https://www.workbuddy.cn（internal/upstream.New 的 ChatBaseCN，官方桌面端
+		// product.json 的 endpoint）。
+		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
+		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
 	} `json:"cn"`
 
@@ -205,6 +245,12 @@ type Config struct {
 		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
 		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
 		SanitizeBrandScope string `json:"sanitize_brand_scope"`
+		// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关。
+		// 默认关闭——上游嵌入只注册了 bge-m3 一个模型（1024 维），实际可用性随账号/租户
+		// 而异，且与对话模型是两套注册表，不适合默认敞开。面板保存后经 livecfg 热生效。
+		// 关闭时端点仍在，但回 403 embeddings_disabled（而不是 404：让调用方看得出
+		// 「功能存在、只是没开」，不用去猜路径拼错）。
+		EmbeddingsEnabled bool `json:"embeddings_enabled"`
 	} `json:"features"`
 
 	Models struct {
@@ -212,6 +258,14 @@ type Config struct {
 		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
 		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// Allowed 对外暴露的模型白名单（issue #68）。条目语法与 Hidden 一致：
+		// 裸名=两域都允许；"cn:xxx"/"global:xxx"=只允许该域。空数组/未配置 =
+		// 白名单不启用（默认放行全部，向后兼容）。非空时仅白名单内模型可出现在
+		// /v1/models 并被点名调用，白名单外一律 400 拒绝（不打上游）。生效点在
+		// 别名映射之后（别名解析出的真实目标同样受检，不能绕过白名单）；与 Hidden
+		// 共存时取交集语义：Allowed 圈定「可能可见」集合，Hidden 仍可从中再剔除。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Allowed []string `json:"allowed"`
 		// Aliases 模型映射表（issue #30）："客户端名=真实模型名" 条目数组，与 Hidden
 		// 同存储形态（数组整体覆盖，面板删条目无需重启）。键：裸名=两域生效，
 		// "cn:x"/"global:x"=只在该域生效；键大小写不敏感。值可带 realm 前缀实现跨域
@@ -221,6 +275,31 @@ type Config struct {
 		// 面板保存后经 livecfg 热生效，无需重启。
 		Aliases []string `json:"aliases"`
 	} `json:"models"`
+
+	// Thinking 网关思考档位策略（issue #18 / #21）。网关按模型声明的
+	// supportedEfforts 解析目标档：缺档时补默认档，可按开关以网关优先改写客户端
+	// 档位；面板保存后经 upstream.Client.SetEffortPolicy 热生效，无需重启。
+	Thinking struct {
+		// Enabled 策略总开关。false = 网关完全不碰档位（只剩既有 injectThinking
+		// 与降级管线），老配置不写本键时按 Default() 的 true 生效。
+		Enabled bool `json:"enabled"`
+		// DefaultEffort 网关目标档。取值 "max"（默认；取模型支持的最高档）或
+		// low/medium/high/xhigh 等具体档位（模型不支持时落到 ≤ 该档的最高支持档）。
+		// 对 deepseek 等缺档请求，网关会同时注入 thinking.type=enabled。
+		DefaultEffort string `json:"default_effort"`
+		// ClientPriority true = 客户端优先：客户端发了档位就照单全收（含 off），
+		// 只在客户端没发时补 DefaultEffort；false = 网关优先，按 OverrideScope 改写。
+		ClientPriority bool `json:"client_priority"`
+		// OverrideScope 网关优先的作用域（ClientPriority=false 时生效）：
+		//   "level"（默认）= 只覆盖档位，客户端「关闭思考」（off/none/disabled 或
+		//       thinking.type=disabled）一律尊重；
+		//   "all" = 档位与开关一起覆盖：客户端的关闭意图也会被改写成开启 + 目标档。
+		OverrideScope string `json:"override_scope"`
+		// ModelDefaults 按模型覆盖 DefaultEffort：键 "cn:model" / "global:model"
+		// （精确到域）或裸 "model"（两域共用）；值 "max"/"high"/…，或 "inherit"
+		// 表示不覆盖。解析时剔除空值与 inherit，键值统一转小写。
+		ModelDefaults map[string]string `json:"model_defaults,omitempty"`
+	} `json:"thinking"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -334,6 +413,13 @@ type Config struct {
 		ClearTicks          int    `json:"clear_ticks"`
 		SendResolve         bool   `json:"send_resolve"`
 	} `json:"alerting"`
+
+	// Watchdog 上游目录改版监控：定期对 /v1/models 结果取指纹，变了经告警 webhook 通知。
+	// 默认关闭——它只在「想第一时间知道上游改了目录」时有价值，开了才有轮询成本。
+	Watchdog struct {
+		Enabled         bool `json:"enabled"`
+		IntervalSeconds int  `json:"interval_seconds"`
+	} `json:"watchdog"`
 	Budget struct {
 		DailyCreditLimit float64 `json:"daily_credit_limit"` // 0 = 不限
 		// BurstCreditLimit 5 分钟窗口内累计 credit 达此值即拒绝（0 = 关闭）。
@@ -361,12 +447,16 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
+	ShutdownTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
+		// 默认只绑回环：网关 + 面板 + 空/弱 api_key 同时暴露在公网是这份配置最危险的
+		// 组合。要对外先过反代（nginx/caddy），确需直连再显式改 0.0.0.0:7863。
+		Listen:    "127.0.0.1:7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
@@ -374,7 +464,9 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.ShutdownTimeout = "30s"
 	c.Panel.PackageDetailLimit = 5
+	c.Update.AutoTime = "04:00"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -426,6 +518,12 @@ func Default() *Config {
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.SanitizeBrandScope = "all"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
+	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
+	c.Thinking.Enabled = true
+	c.Thinking.DefaultEffort = "max"
+	c.Thinking.ClientPriority = true
+	c.Thinking.OverrideScope = "level"
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
@@ -454,6 +552,7 @@ func Default() *Config {
 	c.Alerting.RecoverHealthy = 1
 	c.Alerting.ForTicks = 2
 	c.Alerting.ClearTicks = 2
+	c.Watchdog.IntervalSeconds = 3600 // 目录变化是低频事件，一小时一次足够
 	return c
 }
 
@@ -613,6 +712,23 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
 	}
+	// 思考档位策略（thinking 节）。bool 解析失败视为不生效（与其它 env 同口径）。
+	if v := os.Getenv("WB2A_THINKING_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Thinking.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_THINKING_DEFAULT_EFFORT"); v != "" {
+		c.Thinking.DefaultEffort = v
+	}
+	if v := os.Getenv("WB2A_THINKING_CLIENT_PRIORITY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Thinking.ClientPriority = b
+		}
+	}
+	if v := os.Getenv("WB2A_THINKING_OVERRIDE_SCOPE"); v != "" {
+		c.Thinking.OverrideScope = v
+	}
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
@@ -629,6 +745,21 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Schedule.AccountSpreadMinGapSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_BALANCE_REFRESH_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.BalanceRefreshJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_TASK_SWEEP_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.TaskSweepJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_NIGHT_ACCOUNT_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.NightAccountCap = n
 		}
 	}
 	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
@@ -688,6 +819,10 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
 		{"WB2A_SANITIZE_BRAND_SCOPE", "features.sanitize_brand_scope", ""},
 		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
+		{"WB2A_THINKING_ENABLED", "thinking.enabled", "bool"},
+		{"WB2A_THINKING_DEFAULT_EFFORT", "thinking.default_effort", ""},
+		{"WB2A_THINKING_CLIENT_PRIORITY", "thinking.client_priority", "bool"},
+		{"WB2A_THINKING_OVERRIDE_SCOPE", "thinking.override_scope", ""},
 		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
 		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
 		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES", "schedule.account_spread_minutes", "int"},
@@ -737,9 +872,23 @@ func splitCSV(raw string) []string {
 
 func (c *Config) normalize() error {
 	var err error
+	if err = c.normalizeThinking(); err != nil {
+		return err
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	if c.Watchdog.IntervalSeconds <= 0 {
+		c.Watchdog.IntervalSeconds = 3600
+	}
+	if c.Update.AutoTime == "" {
+		c.Update.AutoTime = "04:00"
+	}
+	if !isClockTime(c.Update.AutoTime) {
+		return fmt.Errorf("update.auto_time: %q 不是合法时间（HH:MM，按上海时间）", c.Update.AutoTime)
+	}
+	// PollIntervalSec 不做回落：0 = 缺省（前端 5s），负数 = 关闭自动刷新。
+	// 两者都是合法取值，normalize 必须原样保留（回落会把「关闭」变成「5 秒」）。
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
@@ -756,6 +905,17 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
+	//（立即退）；负值 fail fast。
+	if c.Server.ShutdownTimeout == "" {
+		c.Server.ShutdownTimeout = "30s"
+	}
+	if c.ShutdownTimeoutDur, err = time.ParseDuration(c.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %q %w", c.Server.ShutdownTimeout, err)
+	}
+	if c.ShutdownTimeoutDur < 0 {
+		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -968,6 +1128,19 @@ func (c *Config) normalize() error {
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
+	// 抖动合法性（上限 50%）：非法值直接报错而非静默钳位——配置错误该在启动时暴露。
+	if c.Schedule.BalanceRefreshJitterPermill < 0 || c.Schedule.BalanceRefreshJitterPermill > 500 {
+		return fmt.Errorf("schedule.balance_refresh_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.BalanceRefreshJitterPermill)
+	}
+	if c.Schedule.TaskSweepJitterPermill < 0 || c.Schedule.TaskSweepJitterPermill > 500 {
+		return fmt.Errorf("schedule.task_sweep_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.TaskSweepJitterPermill)
+	}
+	if c.Schedule.NightAccountCap < 0 {
+		return fmt.Errorf("schedule.night_account_cap: %d 非法（0 = 不限，>0 = Top-N）", c.Schedule.NightAccountCap)
+	}
+	if c.Schedule.MakeupCardsPerRound < 0 {
+		return fmt.Errorf("schedule.makeup_cards_per_round: %d 非法（0 = 不限，>0 = 每轮上限）", c.Schedule.MakeupCardsPerRound)
+	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
@@ -980,6 +1153,47 @@ func (c *Config) normalize() error {
 // custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
 // （两模式共用同一加载路径，PromptText 均非空）。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// normalizeThinking 校验并规范化 thinking 节（思考档位策略）。
+//
+// 空串回落默认；非法档位 / 作用域 fail fast——静默丢弃会让「面板填了 high」
+// 悄悄按 max 跑，用户无从判断策略是否生效。thinking.model_defaults 的 val 为
+// "" 或 "inherit" 表示「不覆盖」（等价于删除该键），用于面板「恢复全局默认」；
+// val 可以是 off（该模型在网关侧固定关闭思考），全局 default_effort 不允许 off。
+func (c *Config) normalizeThinking() error {
+	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
+	if c.Thinking.DefaultEffort == "" {
+		c.Thinking.DefaultEffort = "max"
+	}
+	if c.Thinking.DefaultEffort == "off" || !upstream.IsEffortLevel(c.Thinking.DefaultEffort) {
+		return fmt.Errorf("thinking.default_effort: %q 不是合法档位（max 或 low/medium/high/xhigh 等）", c.Thinking.DefaultEffort)
+	}
+	scope := strings.ToLower(strings.TrimSpace(c.Thinking.OverrideScope))
+	if scope == "" {
+		scope = "level"
+	}
+	if scope != "level" && scope != "all" {
+		return fmt.Errorf("thinking.override_scope: %q 不是合法作用域（level = 只覆盖档位、保留关闭意图；all = 档位与开关一起覆盖）", c.Thinking.OverrideScope)
+	}
+	c.Thinking.OverrideScope = scope
+	out := make(map[string]string, len(c.Thinking.ModelDefaults))
+	for k, v := range c.Thinking.ModelDefaults {
+		key := strings.ToLower(strings.TrimSpace(k))
+		val := strings.ToLower(strings.TrimSpace(v))
+		if key == "" {
+			continue
+		}
+		if val == "" || val == "inherit" {
+			continue // 显式不覆盖：等价于删除该键
+		}
+		if !upstream.IsEffortLevel(val) {
+			return fmt.Errorf("thinking.model_defaults[%q]: %q 不是合法档位（max/xhigh/high/medium/low/minimal/off，或 inherit 表示不覆盖）", k, v)
+		}
+		out[key] = val
+	}
+	c.Thinking.ModelDefaults = out
+	return nil
+}
+
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":
@@ -1032,6 +1246,20 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		}
 	}
 	return nil
+}
+
+func isClockTime(value string) bool {
+	if len(value) != 5 || value[2] != ':' {
+		return false
+	}
+	for _, i := range []int{0, 1, 3, 4} {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	hour, errH := strconv.Atoi(value[:2])
+	minute, errM := strconv.Atoi(value[3:])
+	return errH == nil && errM == nil && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
 }
 
 func (c *Config) normalizeAlerting() error {

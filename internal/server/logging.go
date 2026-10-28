@@ -73,6 +73,11 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// toolsDeclared / toolCalls 本轮工具面观测量（issue #44）：声明数与实际调用数。
+	// 前者 >0 且后者 ==0 即「零工具调用收尾」，归档里可据此算发生率。
+	toolsDeclared int
+	toolCalls     int
+
 	// 上游调用分段耗时（见 upstream.ChatTiming）：prep 本地准备、do 上游往返。
 	// 零值 = 未测量（非流式/未走到上游）。
 	prep, do time.Duration
@@ -410,6 +415,24 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
+// toolCallCount 非流式聚合响应里的工具调用个数（issue #44 观测用）。
+// 只计数，不解析名字与参数。
+func toolCallCount(resp map[string]any) int {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return 0
+	}
+	ch, _ := choices[0].(map[string]any)
+	msg, _ := ch["message"].(map[string]any)
+	// upstream.Aggregate 组包用 []map[string]any，直解上游 JSON 是 []any —— 两种都得认，
+	// 否则非流式这一半永远是 0（issue #44 的比率就会被算高一倍）。
+	if tcs, ok := msg["tool_calls"].([]map[string]any); ok {
+		return len(tcs)
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	return len(tcs)
+}
+
 func completionTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
 	if !ok {
@@ -517,9 +540,17 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		// 缓存命中/未命中（issue #92 同步）：hasCache 未置位时为零值，omitempty 省略。
 		e.CacheHitTokens = int64(s.cacheHit)
 		e.CacheMissTokens = int64(s.cacheMiss)
+		e.Mode = s.mode
+		e.ReasoningEffort = s.effort
+		if s.think >= 0 {
+			e.ReasoningTokens = int64(s.think)
+		}
+		e.ToolsDeclared = s.toolsDeclared
+		e.ToolCalls = s.toolCalls
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.ExecutorType = deriveExecutorType(t.userAgent)
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
@@ -601,7 +632,8 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 //
 // effort 为生效档位、effortReq 为客户端原始档位（见 chatStat 字段注释）：
 // 两者相同只报 effort=；不同报 effort=max->high（客户端要什么、实际发出去什么
-// 一眼可见）；客户端未携带则两个都不报。
+// 一眼可见）；客户端关思考（off/none/disabled）时生效值被清空，报客户端原值
+// effort=off；连档位都没带时报 effort=-。
 func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	think int, cacheHit, cacheMiss int, hasCache bool,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
@@ -645,16 +677,20 @@ func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, st
 	if do > 0 || prep > 0 {
 		split = fmt.Sprintf(" prep=%dms do=%dms", prep.Milliseconds(), do.Milliseconds())
 	}
-	// 思考档位（见 upstream.normalizeReasoningEffort）：只在客户端携带过该字段时输出，
-	// 让"我要 medium 实际发出去的却是 low"这类静默改写当场可见。
-	// 被降级时显示 requested->effective（issue #43：只报生效值会让读者误以为
-	// 客户端根本没发 max，实际是模型档位表里没有这一档）。
-	if effort != "" {
-		if effortReq != "" && !strings.EqualFold(effortReq, effort) {
-			split += " effort=" + effortReq + "->" + effort
-		} else {
-			split += " effort=" + effort
-		}
+	// 思考档位（见 upstream.normalizeReasoningEffort）：每一行都给出，便于对照
+	// 「客户端要什么 / 网关实际发什么 / 根本没档位」三类情况：
+	//   - 降级：effort=max->high（issue #43：只报生效值会被读成客户端没发 max）
+	//   - 客户端关思考（off/none/disabled）：生效档位会被清空，显示客户端原值 effort=off
+	//   - 完全没档位：effort=-（网关关闭策略或模型不支持档位时就是这一种）
+	switch {
+	case effort != "" && effortReq != "" && !strings.EqualFold(effortReq, effort):
+		split += " effort=" + effortReq + "->" + effort
+	case effort != "":
+		split += " effort=" + effort
+	case effortReq != "":
+		split += " effort=" + effortReq
+	default:
+		split += " effort=-"
 	}
 	extra := ""
 	if requestID != "" {
@@ -749,4 +785,32 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	}
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
+}
+
+func deriveExecutorType(ua string) string {
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "antigravity"):
+		return "AntigravityExecutor"
+	case strings.Contains(lower, "codex"):
+		return "CodexExecutor"
+	case strings.Contains(lower, "claude"):
+		return "ClaudeCodeExecutor"
+	case strings.Contains(lower, "cursor"):
+		return "CursorExecutor"
+	case strings.Contains(lower, "continue"):
+		return "ContinueExecutor"
+	case strings.Contains(lower, "asyncopenai") || strings.Contains(lower, "openai") || strings.Contains(lower, "python"):
+		return "OpenAIClient"
+	case strings.Contains(lower, "curl") || strings.Contains(lower, "http"):
+		return "HTTPClient"
+	default:
+		if ua != "" {
+			parts := strings.Split(ua, "/")
+			if len(parts) > 0 && len(parts[0]) <= 20 {
+				return parts[0] + "Executor"
+			}
+		}
+		return "WorkBuddyExecutor"
+	}
 }

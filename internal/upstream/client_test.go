@@ -140,13 +140,16 @@ func TestClassify(t *testing.T) {
 		// 其他业务码不劫持（不许把网关 401 的判定扩张到带信封的响应）。
 		{401, `{"code":12153,"msg":"12153:refresh token is invalid"}`, ErrSessionDead},
 		{401, `{"code":1,"msg":"unknown business error"}`, ErrClient},
-		// 6021「queue.full.title」渠道级准入队列满：任意状态码都判 upstream_busy
-		//（防上游换状态码），结构化 code 主判、requestId 含 "6021" 不误伤。
+		// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+		// 任意状态码都判 upstream_busy（防上游换状态码），结构化 code 主判、
+		// requestId 含 "6020"/"6021" 不误伤。
+		{429, `{"code":6020,"msg":"queue.waiting.title","requestId":"01a16e3d95b4a000e3385c807c"}`, ErrUpstreamBusy},
 		{429, `{"code":6021,"msg":"queue.full.title","requestId":"341738971737c911985e5b9e67a4eceb"}`, ErrUpstreamBusy},
 		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
 		// 防过宽：普通 429（无 queue 语义）仍是账号级软限流。
 		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
+		{429, `{"requestId":"6020","msg":"rate limit"}`, ErrSoftRate},
 		// 11148 工具配对断裂：请求内容级（上游「直接重试无效，请新建任务」），
 		// 换号/重试必然同样失败——不得落 ErrClient 白轮转全池。
 		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
@@ -386,6 +389,66 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 }
 
+func TestEffortPolicyWiredThroughChatStream(t *testing.T) {
+	// 策略接线测试：SetEffortPolicy → prepareBody → 出站 JSON。单元测试直接调
+	// applyEffortPolicy，这条补上「客户端实例真的把策略带进请求」的缺口。
+	var outbound []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
+			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
+		default:
+			outbound, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	if _, err := c.FetchModels(a); err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	send := func(body string) map[string]any {
+		t.Helper()
+		rc, status, _, err := c.ChatStream(a, []byte(body), "", ChatMeta{})
+		if err != nil || status != 200 {
+			t.Fatalf("chat: status=%d err=%v", status, err)
+		}
+		rc.Close()
+		var m map[string]any
+		if err := json.Unmarshal(outbound, &m); err != nil {
+			t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
+		}
+		return m
+	}
+
+	c.SetEffortPolicy(&EffortPolicy{Enabled: true, DefaultEffort: "max", OverrideScope: OverrideScopeLevel})
+	// 客户端没发档位 → 网关补 max 解析后的最高档 high
+	if got := send(`{"model":"glm-5.2","messages":[]}`)["reasoning_effort"]; got != "high" {
+		t.Errorf("filled effort=%v want high", got)
+	}
+	// 网关优先 → 客户端 low 被改写 high
+	if got := send(`{"model":"glm-5.2","reasoning_effort":"low","messages":[]}`)["reasoning_effort"]; got != "high" {
+		t.Errorf("gateway-priority effort=%v want high", got)
+	}
+	// 客户端优先 → 保留 low
+	c.SetEffortPolicy(&EffortPolicy{Enabled: true, ClientPriority: true, DefaultEffort: "max"})
+	if got := send(`{"model":"glm-5.2","reasoning_effort":"low","messages":[]}`)["reasoning_effort"]; got != "low" {
+		t.Errorf("client-priority effort=%v want low", got)
+	}
+	// 策略关闭 → 逐字节透传（只剩既有的支持档钳制，low 本身合规）
+	c.SetEffortPolicy(&EffortPolicy{Enabled: false, DefaultEffort: "max"})
+	if got := send(`{"model":"glm-5.2","messages":[]}`)["reasoning_effort"]; got != nil {
+		t.Errorf("policy off should not inject, got %v", got)
+	}
+}
+
 func TestChatStreamHardCreditError(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
@@ -554,8 +617,8 @@ func TestGlobalBaseByDomain(t *testing.T) {
 		{name: "global 非国际域回落默认", realm: "global", domain: "example.com",
 			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
 		// 非 global 账号恒走 CN 三域（realm 决定域，domain 只在 global 内选主机）。
-		// CN 三个 base：chat=workbuddy.cn（官方主域，见 client.go New 的注释）、
-		// billing=codebuddy.cn、web=workbuddy.cn。
+		// CN 三个 base 本来就不同源：chat/web=workbuddy.cn（官方主域，见 client.go
+		// New 的注释）、billing=codebuddy.cn。
 		{name: "空 domain 非 global 走 CN", domain: "",
 			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.codebuddy.cn", wantWeb: "https://www.workbuddy.cn"},
 		{name: "非国际域非 global 走 CN", domain: "example.com",

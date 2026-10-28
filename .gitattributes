@@ -1,0 +1,24 @@
+# 统一按 LF 检出：本仓的 JS 前端测试用 `indexOf('async function loadEvents() {')`
+# 这类**含 \n 的字面量**在源码里定锚，CRLF 检出会让锚点全部落空、测试假红
+# （Windows 上默认 core.autocrlf=true 时必现）。仓库内 blob 一直是 LF，这里只是把
+# 检出行为钉死，不改变任何已提交内容。
+* text=auto eol=lf
+
+# 二进制：不做行尾转换，也不做文本 diff。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.apk binary
+*.ipk binary
+
+# Windows 批处理必须是 CRLF：cmd.exe 对 LF-only 的 .bat 会在某些版本上解析出错。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# shell 脚本保持 LF（Git Bash / Linux / macOS 都要能直接执行）。
+*.sh text eol=lf
+*.command text eol=lf
