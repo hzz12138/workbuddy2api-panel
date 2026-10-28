@@ -50,6 +50,11 @@ var appVersion = "dev"
 // 发布构建由 CI 用 -X 注入 github.repository（谁构建就跟随谁），本地构建保持本值。
 var appRepository = "hzz12138/workbuddy2api-panel"
 
+// upstreamRepo 上游作者的仓库：**永远不能**作为 appRepository（见 appversion_test.go）。
+// 留作常量是为了让「不许指回上游」这条断言有一个单一事实来源，而不是把字符串
+// 散落在测试里。
+const upstreamRepo = "misakano7545/workbuddy2api-panel"
+
 // insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
 // 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（显式配成
 // "0.0.0.0:7863" 或 ":7863"）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
